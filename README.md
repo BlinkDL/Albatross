@@ -4,6 +4,8 @@ efficient RWKV inference engine
 ## Result @ 250904
 
 Baseline performance for RWKV-7 7.2B bsz=1 @ RTX5090, simply abysmal lol
+
+Let me know if you can find simple methods (such as tuning torch.compile etc.) to improve these a bit
 ```
 Token/s = 75.1 (forward), 73.76 (full) || Bandwidth = 1041.2 GB/s || 3.722s
 
