@@ -50,12 +50,10 @@ def xprint(s):
 xprint("Basic")
 
 prompt = "The Eiffel tower is in the city of"
-init_out, init_state = model.forward(tokenizer.encode(prompt), None)
-
-probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
-
 print(prompt)
 
+init_out, init_state = model.forward(tokenizer.encode(prompt), None)
+probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
 _, indices = torch.topk(probs, 5) # print top-5 possibilities
 for i in range(len(indices)):
     token_id = indices[i].item()
@@ -73,18 +71,16 @@ prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
 LENGTH_PER_TRIAL = 256
 TEMPERATURE = 1.0
 TOP_P = 0.0
-init_out, init_state = model.forward(tokenizer.encode(prompt), None)
-
 print(prompt, end="")
+
 all_tokens = []
 out_last = 0
+init_out, init_state = model.forward(tokenizer.encode(prompt), None)
 out, state = init_out.clone(), copy.deepcopy(init_state)
 
 min_time = 1e10
 min_time_all = 1e10
-
 t000 = time.perf_counter()
-
 for i in range(LENGTH_PER_TRIAL):
     t00 = time.perf_counter()
     token = sample_logits(out, TEMPERATURE, TOP_P)
@@ -93,7 +89,7 @@ for i in range(LENGTH_PER_TRIAL):
         tmp = tokenizer.decode(all_tokens[out_last:])
         if '\ufffd' not in tmp: # only print when we have a valid utf-8 string
             print(tmp, end="", flush=True)
-            out_last = i + 1
+            out_last = i+1
     except:
         pass
     t0 = time.perf_counter()
@@ -109,18 +105,40 @@ print(f'\n\nToken/s = {round(1/min_time_all,2)} (real), {round(1/min_time,2)} (i
 
 #######################################################################################################
 
-# xprint("Prefill")
+xprint("Prefill")
+
+raw = open("eval/calibration_data_v5_rc.txt").read()
+tokens = tokenizer.encode(raw)
+# print(len(tokens))
+
+for stage in range(9, 12+1):
+    CTX_LEN = 2**stage
+    loss = 0
+    a = 0
+    cnt = 0
+    while a+CTX_LEN < len(tokens):
+        src = tokens[a:a+CTX_LEN]
+        prob, _ = model.forward(src[:-1], None, full_output=True)
+        prob = F.softmax(prob.float(), dim=-1)
+        for j in range(CTX_LEN-1):
+            loss -= math.log(prob[j][src[j+1]])
+            cnt += 1
+        a += CTX_LEN
+    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)}')
 
 #######################################################################################################
 
 xprint("Arithmetic")
 
-def eval_qa(todo, print_interval, loss_mode = False):
+def eval_qa(todo, print_interval, pad_eod = True, loss_mode = False):
     xsum = 0
     xcnt = 0
     xacc = 0
     for d in todo:
-        src = [0] + tokenizer.encode(d[0])
+        if pad_eod:
+            src = [0] + tokenizer.encode(d[0])
+        else:
+            src = tokenizer.encode(d[0])
         dst = tokenizer.encode(d[1])
 
         logits = 0
@@ -140,13 +158,13 @@ def eval_qa(todo, print_interval, loss_mode = False):
         xacc += 1 if correct else 0
         if xcnt % print_interval == 0 or xcnt == len(todo):
             if loss_mode:
-                print('loss', round(-xsum / xcnt, 2), 'acc', round(xacc/xcnt*100, 2))
+                print('loss', round(-xsum / xcnt, 2), 'acc', round(xacc/xcnt*100, 1))
             else:
-                print(xcnt, 'ppl', round(math.exp(-xsum / xcnt), 2), 'acc', round(xacc/xcnt*100, 2))
+                print(xcnt, 'ppl', round(math.exp(-xsum / xcnt), 2), 'acc', round(xacc/xcnt*100, 1))
 
 x1, x2 = 1, 2
 magic = (5**(0.5)-1)/2
-for stage in range(3,7+1):
+for stage in range(2,7+1):
     todo = []
     NUMBER_LIMIT = 10**stage
     for i in range(200):
@@ -154,11 +172,13 @@ for stage in range(3,7+1):
         x2 += i*i
         s1 = int(magic * x1 * NUMBER_LIMIT) % NUMBER_LIMIT
         s2 = int(magic * x2 * NUMBER_LIMIT) % NUMBER_LIMIT
-        todo.append([f'Assistant: {s1}+{s2}=',str(s1+s2)])
-        todo.append([f'Assistant: {s1}-{s2}=',str(s1-s2)])
+        # todo.append([f'\nAssistant: {s1}+{s2}=',str(s1+s2)])
+        # todo.append([f'\nAssistant: {s1}-{s2}=',str(s1-s2)])
+        todo.append([f'\nA: 123+321=444\n{s1}+{s2}=',str(s1+s2)]) # better prompt
+        todo.append([f'\nA: 123-321=-198\n{s1}-{s2}=',str(s1-s2)]) # better prompt
     # print(todo)
     print(f"Len {stage} : ", end="")
-    eval_qa(todo, 99999999, loss_mode=True)
+    eval_qa(todo, 99999999, pad_eod=False, loss_mode=True)
 
 #######################################################################################################
 
@@ -168,14 +188,14 @@ class LCG:
     def __init__(self, seed=42):
         self.m = 2**32  # Modulus
         self.a = 1664525  # Multiplier
-        self.c = 1013904223  # Increment        
+        self.c = 1013904223  # Increment
         self.state = seed
     def _generate(self):
         self.state = (self.a * self.state + self.c) % self.m
         return self.state
     def randint(self, min_val, max_val):
         if min_val > max_val:
-            raise ValueError("min_val cannot be greater than max_val")            
+            raise ValueError("min_val cannot be greater than max_val")
         range_size = max_val - min_val + 1
         return min_val + self._generate() % range_size
 lcg = LCG()
@@ -203,7 +223,7 @@ for stage in range(4):
         l_min = min(l, l_min)
         l_max = max(l, l_max)
         s = generate_random_string(l, lcg)
-        todo.append([f'The secret is {s}. Repeat: the secret is', f' {s}'])
+        todo.append([f'\nYou must remember the secret is {s}. Repeat: the secret is', f' {s}'])
     print(f"Len {l_min} to {l_max} : ", end="")
     eval_qa(todo, 99999999, loss_mode=True)
 
