@@ -32,11 +32,25 @@ args.n_embd = 768
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.n_layer = 24
 # args.n_embd = 2048
+# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
+# args.n_layer = 32
+# args.n_embd = 2560
+# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g0a-7.2b-20250829-ctx4096"
+# args.n_layer = 32
+# args.n_embd = 4096
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
 from reference.rwkv7 import RWKV_x070
 model = RWKV_x070(args)
+
+PARAM_BYTES = 2
+active_params = 0
+for k,v in model.z.items():
+    if 'emb' not in k:
+        active_params += v.numel()
+active_GB = active_params/1e9*PARAM_BYTES
+print(f'\nActive params = {round(active_params/1e9,2)} B = {round(active_GB,2)} GB (gigabytes)')
 
 from reference.utils import TRIE_TOKENIZER, sample_logits
 tokenizer = TRIE_TOKENIZER("reference/rwkv_vocab_v20230424.txt")
@@ -92,16 +106,16 @@ for i in range(LENGTH_PER_TRIAL):
             out_last = i+1
     except:
         pass
-    t0 = time.perf_counter()
 
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
     out, state = model.forward(token, state)
-    
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     min_time = min(min_time, t1 - t0)
     min_time_all = min(min_time_all, t1 - t00)
 
-print(f'\n\nToken/s = {round(1/min_time_all,2)} (real), {round(1/min_time,2)} (ignore sampling & tokenizer) || {round(time.perf_counter()-t000,3)}s')
+print(f'\n\nToken/s = {round(1/min_time,2)} (forward), {round(1/min_time_all,2)} (full) || Bandwidth = {round(active_GB/min_time,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
 
 #######################################################################################################
 
@@ -116,15 +130,25 @@ for stage in range(9, 12+1):
     loss = 0
     a = 0
     cnt = 0
+    
+    min_time = 1e10
     while a+CTX_LEN < len(tokens):
         src = tokens[a:a+CTX_LEN]
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         prob, _ = model.forward(src[:-1], None, full_output=True)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        min_time = min(min_time, t1 - t0)
+            
         prob = F.softmax(prob.float(), dim=-1)
         for j in range(CTX_LEN-1):
             loss -= math.log(prob[j][src[j+1]])
             cnt += 1
         a += CTX_LEN
-    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)}')
+
+    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/min_time)} token/s = {round((CTX_LEN-1)/min_time * active_params * 2/1e12, 2)} TFLOPS')
 
 #######################################################################################################
 
