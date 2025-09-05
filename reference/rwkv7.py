@@ -19,13 +19,13 @@ torch._C._jit_set_autocast_mode(False)
 import torch.nn as nn
 from torch.nn import functional as F
 
-MyModule = torch.jit.ScriptModule
-MyFunction = torch.jit.script_method
-MyStatic = torch.jit.script
-# MyModule = nn.Module
-# def __nop(ob): return ob
-# MyFunction = __nop
-# MyStatic = __nop
+# MyModule = torch.jit.ScriptModule
+# MyFunction = torch.jit.script_method
+# MyStatic = torch.jit.script
+MyModule = nn.Module
+def __nop(ob): return ob
+MyFunction = __nop
+MyStatic = __nop
 
 DTYPE = torch.half
 
@@ -47,6 +47,8 @@ class WKV_7(torch.autograd.Function):
             y = torch.empty((T, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
             torch.ops.rwkv7_state_fwd_fp16.forward(1, T, C, H, state, r, w, k, v, a, b, y)
             return y
+
+@torch.compiler.disable
 def RWKV7_OP(state, r, w, k, v, a, b):
     return WKV_7.apply(state, r, w, k, v, a, b)
 
@@ -96,7 +98,10 @@ class RWKV_x070(MyModule):
         else:
             return self.forward_one(idx, state)
 
-    @MyFunction
+    @torch.compile(mode='max-autotune-no-cudagraphs')
+    # @torch.compile(mode='reduce-overhead')
+    # @torch.compile(mode='max-autotune')
+    # @MyFunction
     def forward_one(self, idx:int, state:List[torch.Tensor]):
         with torch.no_grad(): 
             z = self.z
@@ -127,7 +132,8 @@ class RWKV_x070(MyModule):
             x = x @ z['head.weight']
             return x, state
         
-    @MyFunction
+    # @torch.compile(mode='max-autotune-no-cudagraphs')
+    # @MyFunction
     def forward_seq(self, idx:List[int], state:List[torch.Tensor], full_output:bool=False):
         with torch.no_grad(): 
             z = self.z
