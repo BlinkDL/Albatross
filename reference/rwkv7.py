@@ -98,9 +98,10 @@ class RWKV_x070(MyModule):
         else:
             return self.forward_one(idx, state)
 
-    # @torch.compile(mode='max-autotune-no-cudagraphs')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     # @torch.compile(mode='reduce-overhead')
-    @torch.compile(mode='max-autotune')
+    # @torch.compile(mode='max-autotune')
+    # @MyFunction
     def forward_one(self, idx:int, state:List[torch.Tensor]):
         with torch.no_grad(): 
             z = self.z
@@ -131,7 +132,8 @@ class RWKV_x070(MyModule):
             x = x @ z['head.weight']
             return x, state
         
-    @torch.compile(mode='max-autotune-no-cudagraphs')
+    # @torch.compile(mode='max-autotune-no-cudagraphs')
+    # @MyFunction
     def forward_seq(self, idx:List[int], state:List[torch.Tensor], full_output:bool=False):
         with torch.no_grad(): 
             z = self.z
