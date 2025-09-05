@@ -23,7 +23,7 @@ args.head_size = 64
 #
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 #
-args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.1b-20250728-ctx4096"
+args.MODEL_NAME = "./rwkv7-g1a-0.1b-20250728-ctx4096"
 args.n_layer = 12
 args.n_embd = 768
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-0.4b-20250324-ctx4096"
@@ -65,7 +65,7 @@ xprint("Basic")
 
 prompt = "The Eiffel tower is in the city of"
 print(prompt)
-
+torch.compiler.cudagraph_mark_step_begin()
 init_out, init_state = model.forward(tokenizer.encode(prompt), None)
 probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
 _, indices = torch.topk(probs, 5) # print top-5 possibilities
@@ -89,6 +89,7 @@ print(prompt, end="")
 
 all_tokens = []
 out_last = 0
+torch.compiler.cudagraph_mark_step_begin()
 init_out, init_state = model.forward(tokenizer.encode(prompt), None)
 out, state = init_out.clone(), copy.deepcopy(init_state)
 
@@ -109,7 +110,9 @@ for i in range(LENGTH_PER_TRIAL):
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    torch.compiler.cudagraph_mark_step_begin()
     out, state = model.forward(token, state)
+    out, state = out.clone(), copy.deepcopy(state)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     min_time = min(min_time, t1 - t0)
