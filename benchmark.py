@@ -23,12 +23,12 @@ args.head_size = 64
 #
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 #
-args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.1b-20250728-ctx4096"
-args.n_layer = 12
-args.n_embd = 768
-# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-0.4b-20250324-ctx4096"
-# args.n_layer = 24
-# args.n_embd = 1024
+# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.1b-20250728-ctx4096"
+# args.n_layer = 12
+# args.n_embd = 768
+args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
+args.n_layer = 24
+args.n_embd = 1024
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.n_layer = 24
 # args.n_embd = 2048
@@ -66,7 +66,7 @@ xprint("Basic")
 prompt = "The Eiffel tower is in the city of"
 print(prompt)
 
-init_out, init_state = model.forward(tokenizer.encode(prompt), None)
+init_out, _ = model.forward(tokenizer.encode(prompt), None)
 probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
 _, indices = torch.topk(probs, 5) # print top-5 possibilities
 for i in range(len(indices)):
@@ -76,6 +76,43 @@ for i in range(len(indices)):
     token = tokenizer.decode([token_id])
     token_prob = probs[token_id].item()
     print(token, f'[probability {token_prob:.2%}]')
+
+########################################################################################################
+
+xprint("Batch")
+
+prompts = ["The apple can be", "The cat can be"]
+tokens = [tokenizer.encode(prompt) for prompt in prompts]
+
+# print(tokens)
+# for prompt in prompts:
+#     print(prompt)
+#     init_out, init_state = model.forward(tokenizer.encode(prompt), None)
+#     probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+#     _, indices = torch.topk(probs, 5) # print top-5 possibilities
+#     for i in range(len(indices)):
+#         token_id = indices[i].item()
+#         if token_id == 0:
+#             continue
+#         token = tokenizer.decode([token_id])
+#         token_prob = probs[token_id].item()
+#         print(token, f'[probability {token_prob:.2%}]')
+
+init_outs, _ = model.forward_batch(tokens, None)
+for n in range(len(prompts)):
+    print(prompts[n])
+    init_out = init_outs[n]
+    probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+    _, indices = torch.topk(probs, 5) # print top-5 possibilities
+    for i in range(len(indices)):
+        token_id = indices[i].item()
+        if token_id == 0:
+            continue
+        token = tokenizer.decode([token_id])
+        token_prob = probs[token_id].item()
+        print(token, f'[probability {token_prob:.2%}]')
+    if n != len(prompts)-1:
+        print()
 
 ########################################################################################################
 
@@ -92,8 +129,8 @@ out_last = 0
 init_out, init_state = model.forward(tokenizer.encode(prompt), None)
 out, state = init_out.clone(), copy.deepcopy(init_state)
 
-min_time = 1e10
-min_time_all = 1e10
+times = []
+all_times = []
 t000 = time.perf_counter()
 for i in range(LENGTH_PER_TRIAL):
     t00 = time.perf_counter()
@@ -112,10 +149,71 @@ for i in range(LENGTH_PER_TRIAL):
     out, state = model.forward(token, state)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
-    min_time = min(min_time, t1 - t0)
-    min_time_all = min(min_time_all, t1 - t00)
+    times.append(t1 - t0)
+    all_times.append(t1 - t00)
+times = np.percentile(times, 10)
+all_times = np.percentile(all_times, 10)
+print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full) || Bandwidth = {round(active_GB/times,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
 
-print(f'\n\nToken/s = {round(1/min_time,2)} (forward), {round(1/min_time_all,2)} (full) || Bandwidth = {round(active_GB/min_time,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
+#######################################################################################################
+
+xprint("Decode (batch)")
+
+for BSZ in [2**n for n in range(1,8)]:
+    if BSZ == 2:
+        prompts = ["The apple can be", "The cat can be"]
+    else:
+        prompts = ["The apple can be" for _ in range(BSZ)]
+    nnn = len(prompts)
+    tokens = [tokenizer.encode(prompt) for prompt in prompts]
+    LENGTH_PER_TRIAL = 32
+    TEMPERATURE = 1.0
+    TOP_P = 0.0
+
+    if BSZ == 2:
+        print('wait', end='')
+    all_tokens = []
+    init_out, init_state = model.forward_batch(tokens, None)
+    out, state = init_out.clone(), copy.deepcopy(init_state)
+
+    times = []
+    all_times = []
+    t000 = time.perf_counter()
+    for i in range(LENGTH_PER_TRIAL):
+        t00 = time.perf_counter()
+        token = [[sample_logits(out[n], TEMPERATURE, TOP_P)] for n in range(nnn)]
+        all_tokens += [token]
+        if BSZ == 2:
+            print('.', end='', flush=True)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out, state = model.forward_batch(token, state)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+        all_times.append(t1 - t00)
+
+    times = np.percentile(times, 10)
+    all_times = np.percentile(all_times, 10)
+
+    if BSZ == 2:
+        print('\n')
+        for n in range(nnn):
+            print(prompts[n], end='')
+            aaa_tokens = []
+            out_last = 0
+            for i in range(LENGTH_PER_TRIAL):
+                aaa_tokens += all_tokens[i][n]
+                try:
+                    tmp = tokenizer.decode(aaa_tokens[out_last:])
+                    if '\ufffd' not in tmp: # only print when we have a valid utf-8 string
+                        print(tmp, end="", flush=True)
+                        out_last = i+1
+                except:
+                    pass
+            print('\n')
+
+    print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s (current sampler is very inefficient and bottleneck)')
 
 #######################################################################################################
 
@@ -131,7 +229,7 @@ for stage in range(9, 12+1):
     a = 0
     cnt = 0
     
-    min_time = 1e10
+    times = []
     while a+CTX_LEN < len(tokens):
         src = tokens[a:a+CTX_LEN]
 
@@ -140,7 +238,7 @@ for stage in range(9, 12+1):
         prob, _ = model.forward(src[:-1], None, full_output=True)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        min_time = min(min_time, t1 - t0)
+        times.append(t1 - t0)
             
         prob = F.softmax(prob.float(), dim=-1)
         for j in range(CTX_LEN-1):
@@ -148,7 +246,8 @@ for stage in range(9, 12+1):
             cnt += 1
         a += CTX_LEN
 
-    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/min_time)} token/s = {round((CTX_LEN-1)/min_time * active_params * 2/1e12, 2)} TFLOPS')
+    times = np.percentile(times, 10)
+    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/times)} token/s = {round((CTX_LEN-1)/times * active_params * 2/1e12, 2)} TFLOPS')
 
 #######################################################################################################
 

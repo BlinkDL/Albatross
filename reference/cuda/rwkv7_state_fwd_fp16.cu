@@ -9,10 +9,10 @@ __global__ void kernel_forward(const int B, const int T, const int C, const int 
                                float *__restrict__ _state, const F *__restrict__ const _r, const F *__restrict__ const _w, const F *__restrict__ const _k, const F *__restrict__ const _v, const F *__restrict__ const _a, const F *__restrict__ const _b,
                                F *__restrict__ const _y)
 {
-    const int e = blockIdx.x / H;
+    const int bbb = blockIdx.x / H;
     const int h = blockIdx.x % H;
     const int i = threadIdx.x;
-    _state += h*_N_*_N_ + i*_N_; // wrong if B > 1 !!!
+    _state += bbb*C*_N_ + h*_N_*_N_ + i*_N_;
 
     float state[_N_];
     #pragma unroll
@@ -23,7 +23,7 @@ __global__ void kernel_forward(const int B, const int T, const int C, const int 
 
     for (int _t = 0; _t < T; _t++)
     {
-        const int t = e*T*C + h*_N_ + i + _t * C;
+        const int t = bbb*T*C + h*_N_ + i + _t * C;
         __syncthreads();
         r[i] = float(_r[t]);
         w[i] = __expf(-__expf(float(_w[t])));
@@ -58,6 +58,5 @@ __global__ void kernel_forward(const int B, const int T, const int C, const int 
 void cuda_forward(int B, int T, int C, int H, float *state, dtype *r, dtype* w, dtype *k, dtype *v, dtype *a, dtype *b, dtype *y)
 {
     assert(H*_N_ == C);
-    assert(B == 1); // only for B=1
     kernel_forward<<<dim3(B * H), dim3(_N_)>>>(B, T, C, H, state, r, w, k, v, a, b, y);
 }
