@@ -7,8 +7,8 @@
 import torch
 from torch.nn import functional as F
 
-MyModule = torch.jit.ScriptModule
-MyFunction = torch.jit.script_method
+# MyModule = torch.jit.ScriptModule
+# MyFunction = torch.jit.script_method
 MyStatic = torch.jit.script
 # MyModule = nn.Module
 # def __nop(ob): return ob
@@ -16,6 +16,7 @@ MyStatic = torch.jit.script
 # MyStatic = __nop
 
 @MyStatic
+# @torch.compile("max-autotune")
 def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
     probs = F.softmax(logits.float(), dim=-1)
     sorted_probs, sorted_ids = torch.sort(probs, descending=True)
@@ -38,7 +39,59 @@ def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
     if temperature != 1.0:
         probs = probs ** (1.0 / temperature)
 
-    return torch.multinomial(probs, num_samples=1).item()
+    result_list: list[int] = torch.multinomial(probs, num_samples=1).tolist()
+    return result_list
+
+def sample_logits_batch(logits, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 0):
+    """
+    根据 logits 进行采样，支持批量输入和多种采样策略。
+    
+    参数:
+        logits (Tensor): 输入 logits，形状为 (batch_size, vocab_size)。
+        temperature (float): 温度参数，默认为 1.0。
+        top_p (float): Top-p 截断阈值，默认为 1.0（无截断）。
+        top_k (int): Top-k 截断数量，默认为 0（无截断）。
+    
+    返回:
+        Tensor: 采样结果，形状为 (batch_size,)。
+    """
+    # 应用温度缩放
+    if temperature != 1.0:
+        logits = logits / temperature
+    
+    # 应用 top-k 过滤
+    if top_k > 0:
+        # 获取每个样本中 top-k 位置的值
+        top_k_logits, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+        
+        # 创建掩码，将非 top-k 的位置设为负无穷
+        min_values = top_k_logits[:, -1:]  # 每个样本中第 k 小的值
+        logits = torch.where(logits >= min_values, logits, torch.full_like(logits, float('-inf')))
+    
+    # 应用 top-p (nucleus) 过滤
+    if top_p < 1.0:
+        # 对 logits 进行排序
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        # 找到累积概率超过 top_p 的位置
+        sorted_indices_to_remove = cumulative_probs > top_p
+        
+        # 至少保留第一个（概率最高的）token
+        sorted_indices_to_remove[:, 0] = False
+        
+        # 将需要移除的位置设为负无穷
+        sorted_logits.masked_fill_(sorted_indices_to_remove, float('-inf'))
+        
+        # 将排序后的 logits 转换回原始顺序
+        logits = torch.gather(sorted_logits, dim=-1, index=sorted_indices.argsort(dim=-1))
+    
+    # 从处理后的 logits 中采样
+    probs = F.softmax(logits, dim=-1)
+    samples = torch.multinomial(probs, 1).squeeze(-1)
+    
+    return samples
+
 
 class TRIE:
     __slots__ = tuple("ch,to,values,front".split(","))
@@ -123,12 +176,17 @@ class TRIE_TOKENIZER():
 
     def encode(self, src):
         return self.encodeBytes(src.encode("utf-8"))
+    def batch_encode(self, src):
+        return [self.encodeBytes(s.encode("utf-8")) for s in src]
 
     def decode(self, tokens):
         try:
             return self.decodeBytes(tokens).decode('utf-8')
         except:
             return '\ufffd' # bad utf-8
+        
+    def batch_decode(self, src):
+        return [self.decode([int(s)]) for s in src]
 
     def printTokens(self, tokens):
         for i in tokens:
