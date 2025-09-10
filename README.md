@@ -1,6 +1,10 @@
 # Albatross
 efficient RWKV inference engine
 
+## Result @ 250909
+
+Now with batch inference. 7B fp16 bsz 320 = 5848 token/s decoding (const speed & vram because it's RNN) on 5090. I think 10000 token/s is achievable (full fp16 precision).
+
 ## Result @ 250904
 
 Baseline performance for RWKV-7 7.2B bsz=1 @ RTX5090, simply abysmal lol
