@@ -6,7 +6,7 @@
 
 import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
-import types, torch, copy, time, random, json, math
+import types, torch, copy, time, random, json, math, gc
 from tqdm import tqdm
 from torch.nn import functional as F
 SEED = 42
@@ -26,18 +26,18 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.1b-20250728-ctx4096"
 # args.n_layer = 12
 # args.n_embd = 768
-args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
-args.n_layer = 24
-args.n_embd = 1024
+# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
+# args.n_layer = 24
+# args.n_embd = 1024
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.n_layer = 24
 # args.n_embd = 2048
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
 # args.n_layer = 32
 # args.n_embd = 2560
-# args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g0a-7.2b-20250829-ctx4096"
-# args.n_layer = 32
-# args.n_embd = 4096
+args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g0a-7.2b-20250829-ctx4096"
+args.n_layer = 32
+args.n_embd = 4096
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
@@ -159,7 +159,20 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 
 xprint("Decode (batch)")
 
-for BSZ in [2**n for n in range(1,8)]:
+for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(8, 512, 8)]:
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # seems better to do manual initialization here
+    state = [None for _ in range(args.n_layer * 3)]
+    for i in range(args.n_layer):
+        state[i*3+0] = torch.zeros((BSZ, args.n_embd), dtype=torch.half, requires_grad=False, device="cuda")
+        state[i*3+1] = torch.zeros((BSZ, args.n_embd // args.head_size, args.head_size, args.head_size), dtype=torch.float, requires_grad=False, device="cuda")
+        state[i*3+2] = torch.zeros((BSZ, args.n_embd), dtype=torch.half, requires_grad=False, device="cuda")
+
+    time.sleep(1)
     if BSZ == 2:
         prompts = ["The apple can be", "The cat can be"]
     else:
@@ -173,8 +186,7 @@ for BSZ in [2**n for n in range(1,8)]:
     if BSZ == 2:
         print('wait', end='')
     all_tokens = []
-    init_out, init_state = model.forward_batch(tokens, None)
-    out, state = init_out.clone(), copy.deepcopy(init_state)
+    out, state = model.forward_batch(tokens, state)
 
     times = []
     all_times = []
