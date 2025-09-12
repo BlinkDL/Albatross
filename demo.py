@@ -111,7 +111,7 @@ def computation_process(text_queue, shutdown_event):
                 all_times.clear()
                 # Send performance info to main process
                 if times_tmp > 0 and all_times_tmp > 0:
-                    text_queue.put(("perf", -1, f'Token/s = {round(BATCH_SIZE/times_tmp,2)} (forward), {round(BATCH_SIZE/all_times_tmp,2)} (full)'))
+                    text_queue.put(("perf", -1, f'RWKV-7 7.2B FP16 bsz{BATCH_SIZE} inference @ RTX5090 || Token/s = {round(BATCH_SIZE/times_tmp,2)} (forward), {round(BATCH_SIZE/all_times_tmp,2)} (full) || Const speed & VRAM because this is RNN || https://github.com/BlinkDL/Albatross https://rwkv.com'))
                     
     except Exception as e:
         text_queue.put(("error", -1, f"Error: {str(e)}"))
@@ -288,7 +288,7 @@ class TextGridUI:
                     # Display performance info with color
                     perf_text = self.perf_info[:max_x-1]  # Truncate if too long
                     if curses.has_colors():
-                        self.stdscr.addnstr(0, 0, perf_text, max_x-1, curses.color_pair(2) | curses.A_BOLD)  # Yellow and bold
+                        self.stdscr.addnstr(0, 0, perf_text, max_x-1, curses.color_pair(3) | curses.A_BOLD)  # Yellow and bold
                     else:
                         self.stdscr.addnstr(0, 0, perf_text, max_x-1)
                     self.perf_dirty = False
