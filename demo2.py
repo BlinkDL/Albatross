@@ -11,6 +11,7 @@ import numpy as np
 from torch.nn import functional as F
 
 GRID_W, GRID_H = 20, 16
+# GRID_W, GRID_H = 20, 4
 NUM_PANELS = GRID_W * GRID_H
 BATCH_SIZE = NUM_PANELS
 GENERATION_LENGTH = 4000
@@ -146,7 +147,7 @@ def computation_process(text_queue, shutdown_event, control_queue=None):
                         all_times.clear()
                         # Send performance info to main process
                         if times_tmp > 0 and all_times_tmp > 0:
-                            text_queue.put(("perf", -1, f'{TITLE_MODEL_NAME} {TITLE_PRECISION} bsz{BATCH_SIZE} inference @ {TITLE_GPU_NAME} || Token/s = {round(BATCH_SIZE/times_tmp,2)} (forward), {round(BATCH_SIZE/all_times_tmp,2)} (full) || Const speed & VRAM because this is RNN || https://github.com/BlinkDL/Albatross https://rwkv.com || Press "a" to switch prompt'))
+                            text_queue.put(("perf", -1, f'{TITLE_MODEL_NAME} {TITLE_PRECISION} bsz{BATCH_SIZE} @ {TITLE_GPU_NAME} | Token/s {round(BATCH_SIZE/times_tmp)} (fwd), {round(BATCH_SIZE/all_times_tmp)} (full), const speed & VRAM because RNN | Press "a" to switch prompt | github.com/BlinkDL/Albatross rwkv.com'))
                             
             except StopIteration as e:
                 if str(e) == "prompt_switch":
