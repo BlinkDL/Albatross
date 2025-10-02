@@ -27,7 +27,8 @@ args.head_size = 64
 
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 
-args.MODEL_NAME = "../models/rwkv7-g0a-7.2b-20250829-ctx4096"
+# args.MODEL_NAME = "../models/rwkv7-g0a-7.2b-20250829-ctx4096"
+args.MODEL_NAME = "../models/rwkv7-g1a-2.9b-20250924-ctx4096"
 
 print(f"\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n")
 
@@ -42,6 +43,7 @@ tokenizer = TRIE_TOKENIZER("reference/rwkv_vocab_v20230424.txt")
 ########################################################################################################
 
 
+# @profile
 def continuous_batching(
     model,
     tokenizer,
@@ -64,6 +66,12 @@ def continuous_batching(
     MAX_GENERATE_TOKENS = max_generate_tokens
     BATCH_SIZE = batch_size
     PAD_ZERO = pad_zero
+
+    alpha_presence = torch.tensor(alpha_presence, dtype=torch.float32, device=model.z["head.weight"].device)
+
+    if temperature == 0:  # greedy sampling
+        temperature = 1.0
+        top_k = 1
 
     total_inputs = len(inputs)
 
@@ -190,20 +198,20 @@ def continuous_batching(
         for task in task_pool:
             next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
 
+        # torch.cuda.synchronize()
         out = model.forward_batch(next_tokens, states)
+        # torch.cuda.synchronize()
 
         # repetition penalty
         occurrence *= alpha_decay
         out -= alpha_presence_vector + occurrence * alpha_frequency
 
-        if temperature == 0:  # greedy sampling
-            temperature = 1.0
-            top_k = 1
         if temperature != 1.0:
             out /= temperature
 
         new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
         new_tokens = new_tokens.tolist()
+        # torch.cuda.synchronize()
 
         for task in task_pool:
             state_pos = task["state_pos"]
@@ -235,15 +243,32 @@ def continuous_batching(
 if __name__ == "__main__":
 
     inputs = [f"User: 为什么 {i} 是一个有趣的数字?\n\nAssistant:" for i in range(256)]
-    TEMPERATURE = 1
-    STOP_TOKENS = [0, 261]
-    MAX_GENERATE_TOKENS = 2048
+    TEMPERATURE = 0.3
+    STOP_TOKENS = [0, 261, 24281]
+    MAX_GENERATE_TOKENS = 4096
     BATCH_SIZE = 128
-    TOP_K = 50
+    TOP_K = 1
     TOP_P = 0.3
     PAD_ZERO = False
+    ALPHA_PRESENCE = 0.5
+    ALPHA_FREQUENCY = 0.5
+    ALPHA_DECAY = 0.996
     # Set temperature=0 or top_k=1 for greedy sampling
 
-    outputs = continuous_batching(model, tokenizer, inputs, STOP_TOKENS, MAX_GENERATE_TOKENS, BATCH_SIZE, PAD_ZERO, TEMPERATURE, TOP_K, TOP_P)
+    outputs = continuous_batching(
+        model,
+        tokenizer,
+        inputs,
+        STOP_TOKENS,
+        MAX_GENERATE_TOKENS,
+        BATCH_SIZE,
+        PAD_ZERO,
+        TEMPERATURE,
+        TOP_K,
+        TOP_P,
+        ALPHA_PRESENCE,
+        ALPHA_FREQUENCY,
+        ALPHA_DECAY,
+    )
 
     print(outputs[-1]["generated_text"])
