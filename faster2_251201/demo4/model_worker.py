@@ -108,7 +108,7 @@ def model_process(out_q, ctrl_q, shutdown_event, cfg):
             sent_lengths = [0 for _ in range(page_count)]
             finished_pages = [False for _ in range(page_count)]
             logged_pages = [False for _ in range(page_count)]
-            completion_scanners = [HtmlCompletionScanner() for _ in range(page_count)]
+            completion_scanners = [HtmlCompletionScanner(current_prompt) for _ in range(page_count)]
             log_path, log_file = open_jsonl_log(cfg)
             dirty = set()
             put_reliable(out_q, ("clear_all", None), shutdown_event)
@@ -230,6 +230,17 @@ def model_process(out_q, ctrl_q, shutdown_event, cfg):
                 perf_tokens += page_count
 
                 for idx, token_id in enumerate(flat_tokens):
+                    if token_id == 0:
+                        if not finished_pages[idx]:
+                            finished_pages[idx] = True
+                            write_jsonl_line(log_file, raw_pages[idx])
+                            logged_pages[idx] = True
+                            if send_page_finished(out_q, idx, raw_pages[idx]):
+                                dirty.add(idx)
+                            else:
+                                sent_lengths[idx] = len(raw_pages[idx])
+                                dirty.discard(idx)
+                        continue
                     text = decoders[idx].decode(tokenizer.idx2token[token_id], final=False)
                     if text and not finished_pages[idx]:
                         raw_pages[idx] += text

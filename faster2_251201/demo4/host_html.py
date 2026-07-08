@@ -1,6 +1,8 @@
 import html
 import json
 
+from constants import PROMPT_PRESETS
+
 
 def build_host_html(
     cols,
@@ -112,6 +114,53 @@ def build_host_html(
     }}
     #promptButton:hover {{ background: rgba(255,255,255,.18); }}
     #promptButton:disabled {{ opacity: .55; cursor: default; }}
+    #promptPresetButton {{
+      position: fixed; left: 12px; top: 68px; z-index: 20;
+      display: grid; place-items: center;
+      width: 48px; height: 48px; padding: 0;
+      color: #fff; background: rgba(0,0,0,.58);
+      border: 1px solid rgba(255,255,255,.28); border-radius: 999px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.24);
+      font: 700 22px/22px ui-monospace, monospace; cursor: pointer;
+      pointer-events: auto;
+    }}
+    #promptPresetButton:hover {{ background: rgba(255,255,255,.18); }}
+    #promptPresetButton:disabled {{ opacity: .55; cursor: default; }}
+    #promptPresetOverlay {{
+      position: fixed; inset: 0; z-index: 30; display: none;
+      align-items: center; justify-content: center;
+      background: rgba(0,0,0,.38); pointer-events: auto;
+    }}
+    #promptPresetOverlay.open {{ display: flex; }}
+    #promptPresetDialog {{
+      box-sizing: border-box; width: min(1100px, calc(100vw - 96px)); height: min(720px, calc(100vh - 96px));
+      display: grid; grid-template-rows: auto 1fr auto; gap: 12px;
+      padding: 16px; color: #f4f4f4; background: rgba(18,20,24,.94);
+      border: 1px solid rgba(255,255,255,.24); border-radius: 12px;
+      box-shadow: 0 18px 50px rgba(0,0,0,.40);
+      font: 14px/20px ui-monospace, monospace;
+    }}
+    #promptPresetDialog h2 {{ margin: 0; font: 700 18px/24px ui-monospace, monospace; }}
+    #promptPresetItems {{
+      display: grid; gap: 10px; overflow: auto; padding-right: 12px; scrollbar-gutter: stable;
+    }}
+    #promptPresetItems button {{
+      box-sizing: border-box; width: 100%; height: 40px; padding: 0 12px;
+      color: #111; background: #fff; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      border: 1px solid rgba(255,255,255,.35); border-radius: 8px;
+      font: 14px/20px ui-monospace, monospace; cursor: pointer;
+    }}
+    #promptPresetItems button:hover {{ outline: 2px solid #ffcf70; }}
+    #promptPresetPreview {{
+      position: fixed; left: 0; top: 0; z-index: 31; display: none;
+      box-sizing: border-box; width: min(720px, calc(100vw - 36px)); overflow: visible;
+      padding: 12px 14px; color: #111; background: #fff;
+      border: 1px solid rgba(255,255,255,.35); border-radius: 8px;
+      box-shadow: 0 18px 50px rgba(0,0,0,.40);
+      font: 14px/20px ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+      pointer-events: none;
+    }}
+    #promptPresetPreview.open {{ display: block; }}
     #promptOverlay {{
       position: fixed; inset: 0; z-index: 30; display: none;
       align-items: center; justify-content: center;
@@ -133,14 +182,14 @@ def build_host_html(
       border: 1px solid rgba(255,255,255,.35); border-radius: 8px;
       font: 14px/20px ui-monospace, monospace;
     }}
-    #promptActions {{ display: flex; justify-content: flex-end; gap: 10px; }}
-    #promptActions button {{
+    #promptActions, #promptPresetActions {{ display: flex; justify-content: flex-end; gap: 10px; }}
+    #promptActions button, #promptPresetActions button {{
       min-width: 88px; height: 36px; padding: 0 14px;
       color: #fff; background: rgba(255,255,255,.14);
       border: 1px solid rgba(255,255,255,.30); border-radius: 8px;
       font: 700 14px/20px ui-monospace, monospace; cursor: pointer;
     }}
-    #promptActions button:hover {{ background: rgba(255,255,255,.22); }}
+    #promptActions button:hover, #promptPresetActions button:hover {{ background: rgba(255,255,255,.22); }}
   </style>
 </head>
 <body>
@@ -154,7 +203,18 @@ def build_host_html(
   </nav>
   <button id="bounceButton" type="button" onclick="toggleBounceScroll()" title="Toggle auto bounce scroll" aria-label="Toggle auto bounce scroll" disabled>Scroll: On</button>
   <button id="promptButton" type="button" onclick="openPromptDialog()" title="Edit prompt" aria-label="Edit prompt" disabled>{html.escape("✏️")}</button>
+  <button id="promptPresetButton" type="button" onclick="openPromptPresets()" title="Prompt presets" aria-label="Prompt presets" disabled>{html.escape("☰")}</button>
   <button id="restartButton" type="button" onclick="restartGeneration()" title="Restart" aria-label="Restart" disabled>{html.escape("🔄")}</button>
+  <div id="promptPresetOverlay">
+    <section id="promptPresetDialog" role="dialog" aria-modal="true" aria-label="Prompt presets">
+      <h2>Prompt Presets</h2>
+      <div id="promptPresetItems"></div>
+      <pre id="promptPresetPreview"></pre>
+      <div id="promptPresetActions">
+        <button type="button" onclick="closePromptPresets()">Cancel</button>
+      </div>
+    </section>
+  </div>
   <div id="promptOverlay">
     <section id="promptDialog" role="dialog" aria-modal="true" aria-label="Edit prompt">
       <h2>Edit Prompt</h2>
@@ -168,6 +228,7 @@ def build_host_html(
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script>
     let currentPrompt = {json.dumps(initial_prompt, ensure_ascii=False)};
+    const promptPresets = {json.dumps(PROMPT_PRESETS, ensure_ascii=False)};
     let autoBounceScrollEnabled = {json.dumps(bool(auto_bounce_scroll))};
     const autoBounceScrollStep = {json.dumps(max(1, int(auto_bounce_scroll_step)))};
     const autoBounceScrollTickMs = {json.dumps(max(8, int(auto_bounce_scroll_tick_ms)))};
@@ -185,6 +246,8 @@ def build_host_html(
       if (restart) restart.disabled = !enabled;
       const prompt = document.getElementById('promptButton');
       if (prompt) prompt.disabled = !enabled;
+      const presets = document.getElementById('promptPresetButton');
+      if (presets) presets.disabled = !enabled;
       const bounce = document.getElementById('bounceButton');
       if (bounce) bounce.disabled = !enabled;
     }}
@@ -217,6 +280,76 @@ def build_host_html(
     }}
     function restartGeneration() {{
       if (demo4Bridge) demo4Bridge.handleRestart();
+    }}
+    function openPromptPresets() {{
+      const overlay = document.getElementById('promptPresetOverlay');
+      if (!overlay) return;
+      overlay.classList.add('open');
+      if (demo4Bridge) demo4Bridge.handlePromptEditor(true);
+    }}
+    function closePromptPresets(notify) {{
+      const overlay = document.getElementById('promptPresetOverlay');
+      if (overlay) overlay.classList.remove('open');
+      hidePromptPresetPreview();
+      if (notify !== false && demo4Bridge) demo4Bridge.handlePromptEditor(false);
+    }}
+    function showPromptPresetPreview(prompt, anchor) {{
+      const preview = document.getElementById('promptPresetPreview');
+      if (!preview) return;
+      preview.textContent = String(prompt || '');
+      preview.classList.add('open');
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const dialog = document.getElementById('promptPresetDialog');
+      const dialogRect = dialog ? dialog.getBoundingClientRect() : rect;
+      const gap = 12;
+      const margin = 18;
+      const rightWidth = window.innerWidth - dialogRect.right - gap - margin;
+      const leftWidth = dialogRect.left - gap - margin;
+      let width = Math.min(720, Math.max(280, rightWidth));
+      let left = dialogRect.right + gap;
+      if (rightWidth < 280 && leftWidth > rightWidth) {{
+        width = Math.min(720, Math.max(280, leftWidth));
+        left = dialogRect.left - gap - width;
+      }}
+      preview.style.width = width + 'px';
+      let top = rect.top;
+      const height = preview.offsetHeight;
+      top = Math.max(margin, Math.min(top, window.innerHeight - height - margin));
+      preview.style.left = left + 'px';
+      preview.style.top = top + 'px';
+    }}
+    function hidePromptPresetPreview() {{
+      const preview = document.getElementById('promptPresetPreview');
+      if (preview) preview.classList.remove('open');
+    }}
+    function choosePromptPreset(index) {{
+      const nextPrompt = promptPresets[index];
+      if (typeof nextPrompt !== 'string') return;
+      if (nextPrompt === currentPrompt) {{
+        closePromptPresets(true);
+        return;
+      }}
+      closePromptPresets(false);
+      closePromptDialog(false);
+      currentPrompt = nextPrompt;
+      if (demo4Bridge) demo4Bridge.handlePrompt(nextPrompt);
+    }}
+    function buildPromptPresetList() {{
+      const list = document.getElementById('promptPresetItems');
+      if (!list) return;
+      list.innerHTML = '';
+      promptPresets.forEach(function(prompt, index) {{
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = prompt.replaceAll('\\n', '\\\\n');
+        button.onmouseenter = function() {{ showPromptPresetPreview(prompt, button); }};
+        button.onfocus = function() {{ showPromptPresetPreview(prompt, button); }};
+        button.onmouseleave = hidePromptPresetPreview;
+        button.onblur = hidePromptPresetPreview;
+        button.onclick = function() {{ choosePromptPreset(index); }};
+        list.appendChild(button);
+      }});
     }}
     function openPromptDialog() {{
       const overlay = document.getElementById('promptOverlay');
@@ -256,6 +389,7 @@ def build_host_html(
         demo4Bridge = channel.objects.demo4Bridge;
         enablePager(true);
         updateBounceButton();
+        buildPromptPresetList();
       }});
     }}
     let viewEpoch = 0;

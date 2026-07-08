@@ -11,7 +11,7 @@ from parsing import parse_generated_page
 
 
 def gui_process(in_q, ctrl_q, shutdown_event, cfg):
-    if cfg.get("gui_nice", 0) > 0:
+    if cfg.get("gui_nice", 0) > 0 and hasattr(os, "nice"):
         try:
             os.nice(int(cfg["gui_nice"]))
         except OSError:
@@ -89,7 +89,7 @@ def gui_process(in_q, ctrl_q, shutdown_event, cfg):
 
             settings = self.settings()
             settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, bool(cfg["allow_scripts"]))
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False)
 
             self.loadFinished.connect(self.on_loaded)

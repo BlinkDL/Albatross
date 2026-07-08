@@ -105,6 +105,7 @@ def find_html_candidate(text):
 
 @dataclass
 class HtmlCompletionScanner:
+    initial_text: str = ""
     scan_pos: int = 0
     marker_scan_pos: int = 0
     in_fence: bool = False
@@ -112,25 +113,28 @@ class HtmlCompletionScanner:
     html_started: bool = False
     think_closed: bool = False
     content_offset: int = 0
+    raw_content_offset: int = 0
 
     def update(self, text):
+        scan_text = self.initial_text + text
         if not self.think_closed:
-            close = text.find("</think>")
+            close = scan_text.find("</think>")
             if close < 0:
                 return None
             self.think_closed = True
             self.content_offset = close + len("</think>")
+            self.raw_content_offset = max(0, self.content_offset - len(self.initial_text))
             self.scan_pos = 0
             self.marker_scan_pos = 0
             self.in_fence = False
             self.html_candidate = False
             self.html_started = False
 
-        content = text[self.content_offset :]
+        content = scan_text[self.content_offset :]
         frozen_content = self._update_html_content(content)
         if frozen_content is None:
             return None
-        return text[: self.content_offset + len(frozen_content)]
+        return text[: self.raw_content_offset + len(frozen_content)]
 
     def _update_html_content(self, text):
         direct_end = self._scan_direct_markers(text)
@@ -194,6 +198,7 @@ class HtmlCompletionScanner:
 
 
 def parse_generated_page(raw):
+    raw = raw.split("<|endoftext|>", 1)[0]
     assistant_text = "<think" + raw
     body = assistant_text[len("<think") :]
     if body.startswith(">"):
@@ -201,6 +206,15 @@ def parse_generated_page(raw):
 
     close = body.find("</think>")
     if close < 0:
+        fallback = body
+        html_text, html_start = find_html_candidate(fallback)
+        if html_start is not None:
+            answer = fallback[:html_start].strip()
+            page_render = html_visual_ready(html_text)
+            render_html = html_text.strip() if page_render else render_html_source_preview(raw, html_text)
+            if page_render and "<html" not in render_html.lower() and "<!doctype" not in render_html.lower():
+                render_html = wrap_partial_html(render_html, "Partial HTML")
+            return ParsedPage("", answer, html_text, render_html, "html", page_render)
         thinking = body
         render = render_raw_text_preview(raw)
         return ParsedPage(thinking, "", "", render, "think", False)
