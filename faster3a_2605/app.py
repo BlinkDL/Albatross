@@ -59,6 +59,8 @@ def get_decode_ctx(B: int):
     cached = decode_cache.get(B)
     if cached is not None:
         return cached
+    # app.py does its own graph capture — disable auto-graph in forward_from_x
+    os.environ["CUDA_GRAPH_AUTO"] = "0"
     state = model.zero_state(B)
     x = torch.empty((B, 1, v3a.C), device="cuda", dtype=torch.half)
     path = v3a.select_path(B, 1)
@@ -68,6 +70,7 @@ def get_decode_ctx(B: int):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = model.forward_from_x(x, state, path)
+    os.environ["CUDA_GRAPH_AUTO"] = "1"
     cached = (state, x, graph, output)
     decode_cache[B] = cached
     return cached

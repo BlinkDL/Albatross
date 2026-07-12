@@ -216,10 +216,11 @@ def is_orig_linear_weight(key: str) -> bool:
 
 def load_extensions(wkv_mode: str = "fp16") -> None:
     t0 = time.perf_counter()
-    log(f"loading CUDA extensions v3a_ops + fast_ops + wkv={wkv_mode}")
+    log(f"loading CUDA extensions v3a_ops + fast_ops + nf4_ops + wkv={wkv_mode}")
     cuda_flags = ["-O3", "--use_fast_math", "--extra-device-vectorization"] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
     load(name="rwkv7_v3a_ops", sources=[str(CUDA_DIR / "rwkv7_v3a_ops.cpp"), str(CUDA_DIR / "rwkv7_v3a_ops.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
     load(name="rwkv7_fast_ops_fp16", sources=[str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"), str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
+    load(name="rwkv7_nf4_ops", sources=[str(CUDA_DIR / "rwkv7_nf4_ops.cpp"), str(CUDA_DIR / "rwkv7_nf4_ops.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
     if wkv_mode == "fp16":
         load(name="rwkv7_wkv_fp16_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas", "-O3"])
     elif wkv_mode == "fp32io16":
@@ -262,11 +263,18 @@ class RWKV7:
                 continue
             value = z[key].squeeze()
             dev = key_device(key)
+            # NVFP4: uint8 weights stay uint8, .nf4_b_scale stays float8_e4m3fn, .nvfp4_t_scale stays float32
+            is_nf4_weight = value.dtype == torch.uint8 and key.endswith(".weight")
+            is_nf4_scale = key.endswith(".nf4_b_scale")
+            is_nf4_t_scale = key.endswith(".nvfp4_t_scale")
             is_lowrank = is_lowrank_weight(key)
             if ".ffn.key.weight" in key and CMIX_SPARSE == "auto":
                 z[key + ".fc"] = value.to(device=dev, dtype=DTYPE).contiguous()
             if (
                 not is_lowrank
+                and not is_nf4_weight
+                and not is_nf4_scale
+                and not is_nf4_t_scale
                 and (("key.weight" in key and not is_orig_linear_weight(key))
                 or ("value.weight" in key and not is_orig_linear_weight(key))
                 or ("receptance.weight" in key and not is_orig_linear_weight(key))
@@ -274,7 +282,14 @@ class RWKV7:
                 or ("head.weight" in key and not is_orig_linear_weight(key)))
             ):
                 value = value.t()
-            value = value.to(device=dev, dtype=DTYPE).contiguous()
+            if is_nf4_weight:
+                value = value.to(device=dev).contiguous()
+            elif is_nf4_scale:
+                value = value.to(device=dev).contiguous()
+            elif is_nf4_t_scale:
+                value = value.to(device=dev).contiguous()
+            else:
+                value = value.to(device=dev, dtype=DTYPE).contiguous()
             if key.endswith("att.r_k"):
                 value = value.flatten().contiguous()
             if is_lowrank:
@@ -309,6 +324,19 @@ class RWKV7:
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._graph_cache: dict[tuple[int, int], dict] = {}
+        # NVFP4: build block scale + tensor scale lookup tables (weight id -> scale)
+        self.nf4_block_scales: dict[int, torch.Tensor] = {}
+        self.nf4_t_scales: dict[int, float] = {}
+        for key, val in z.items():
+            if key.endswith(".nf4_b_scale"):
+                base_key = key[:-len(".nf4_b_scale")]
+                if base_key in z:
+                    self.nf4_block_scales[id(z[base_key])] = val
+            elif key.endswith(".nvfp4_t_scale"):
+                base_key = key[:-len(".nvfp4_t_scale")]
+                if base_key in z:
+                    self.nf4_t_scales[id(z[base_key])] = val.item()
         sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
         log(cuda_mem())
@@ -358,6 +386,70 @@ class RWKV7:
         return dev
 
     def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
+        """Forward pass with automatic CUDA Graph caching for repeated (B,T) shapes.
+
+        On first call for a given (B,T), performs warmup + graph capture.
+        Subsequent calls copy input into static buffer and replay the graph.
+        State tensors are updated in-place by the graph replay.
+
+        Disable with CUDA_GRAPH_AUTO=0. State must be the same tensor objects
+        across calls for a given (B,T) — create once with zero_state() and reuse.
+        """
+        B, T, _ = x.shape
+        use_graph = (
+            os.environ.get("CUDA_GRAPH_AUTO", "1") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+            and not all_logits
+            and not pp_enabled()
+            and last_indices is None
+        )
+        if not use_graph:
+            return self._forward_from_x_impl(x, state, path, all_logits, last_indices)
+
+        key = (B, T)
+        cached = self._graph_cache.get(key)
+        if cached is None:
+            log(f"CUDA Graph: capturing B={B} T={T}")
+            static_x = x.clone()
+            # Warmup with throwaway state so user's state is untouched
+            warmup_state = self.zero_state(B)
+            for _ in range(2):
+                self._forward_from_x_impl(static_x, warmup_state, path, False, None)
+            torch.cuda.synchronize()
+            # Capture on side stream (same pattern as bench_case)
+            # Must warmup on capture stream before graph capture
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._forward_from_x_impl(static_x, warmup_state, path, False, None)
+            torch.cuda.current_stream().wait_stream(stream)
+            # Save state before capture — capture will advance it, we must undo
+            state_backup = [s.clone() for s in state]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                static_out = self._forward_from_x_impl(static_x, state, path, False, None)
+            torch.cuda.current_stream().wait_stream(stream)
+            # Restore state to pre-capture values (undo capture's 1-step advance)
+            for s, backup in zip(state, state_backup):
+                s.copy_(backup)
+            self._graph_cache[key] = {
+                "graph": graph,
+                "static_x": static_x,
+                "static_out": static_out,
+            }
+            log(f"CUDA Graph: captured B={B} T={T}")
+            # Replay to get correct output (capture output is unreliable)
+            # This advances state by exactly 1 step — the expected behavior
+            static_x.copy_(x)
+            graph.replay()
+            return static_out.clone()
+
+        # Replay: copy input, replay graph, clone output
+        cached["static_x"].copy_(x)
+        cached["graph"].replay()
+        return cached["static_out"].clone()
+
+    def _forward_from_x_impl(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
         if pp_enabled():
             return self.forward_from_x_pp(x, state, path, all_logits, last_indices)
         z = self.z
@@ -497,6 +589,30 @@ class RWKV7:
         x = self.embed(tokens)
         return self.forward_from_x(x, state, path, last_indices=last_indices)
 
+    def _linear_rkv(self, xr: torch.Tensor, xk: torch.Tensor, xv: torch.Tensor, p: str, path: PathConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute r, k, v — uses fused NVFP4 kernel for T=1 decode, else 3 separate calls."""
+        z = self.z
+        w_r = z[p+"receptance.weight"]
+        if w_r.dtype == torch.uint8 and path.rows == 1:
+            w_k = z[p+"key.weight"]
+            w_v = z[p+"value.weight"]
+            bs_r = self.nf4_block_scales[id(w_r)]
+            bs_k = self.nf4_block_scales[id(w_k)]
+            bs_v = self.nf4_block_scales[id(w_v)]
+            ts_r = self.nf4_t_scales.get(id(w_r), 1.0)
+            ts_k = self.nf4_t_scales.get(id(w_k), 1.0)
+            ts_v = self.nf4_t_scales.get(id(w_v), 1.0)
+            rkv = torch.ops.rwkv7_nf4_ops.linear_nvfp4_rkv_orig_row1_blk16_f16(
+                xr.contiguous(), xk.contiguous(), xv.contiguous(),
+                w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, 4)
+            B, T = xr.shape[0], xr.shape[1]
+            N = w_r.size(0)
+            return rkv[0].view(B, T, N), rkv[1].view(B, T, N), rkv[2].view(B, T, N)
+        r = self.linear_orig_layout(xr, w_r, path, "att_c2c")
+        k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
+        v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+        return r, k, v
+
     def tmix(self, layer: int, x: torch.Tensor, shift_state: torch.Tensor, wkv_state: torch.Tensor, elapsed_t: torch.Tensor, v_first: torch.Tensor, p: str, path: PathConfig, pre_mix=None) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
@@ -505,24 +621,12 @@ class RWKV7:
             xr, xw, xk, xv, xa, xg = pre_mix
         else:
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6(B, T, C, x.contiguous(), shift_state[0], z[p+"x_r"], z[p+"x_w"], z[p+"x_k"], z[p+"x_v"], z[p+"x_a"], z[p+"x_g"])
-        if pre_mix is not None:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+        if path.use_batched_rkv:
+            flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
+            rkv = torch.bmm(flat, z[p+"rkv.weight"])
+            r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
         else:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+            r, k, v = self._linear_rkv(xr, xk, xv, p, path)
 
         v1 = None
         if LOWRANK_WEIGHT != "orig" and can_use_lowrank_fused(path.rows) and can_use_lowrank_out_fused(path.rows) and layer != 0:
@@ -550,7 +654,20 @@ class RWKV7:
             w = self.linear_rank_out_act(w1, z.get(p+"w2"), z.get(p+"w2.t"), path.rows, 1)
             a = self.linear_rank_out(a1, z.get(p+"a2"), z.get(p+"a2.t"), path.rows)
             g = self.linear_rank_out_act(g1, z.get(p+"g2"), z.get(p+"g2.t"), path.rows, 2)
-        k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
+        # Determine dispatch mode once (avoids duplicate condition checks)
+        if T == 1 and WKV_MODE == "fp16" and B <= int(os.environ.get("FUSE_MAX_B", "2")):
+            if os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1":
+                dispatch_mode = "kkag"
+            elif os.environ.get("WKV_LNX_FUSE", "1") == "1":
+                dispatch_mode = "lnx"
+            else:
+                dispatch_mode = "sep"
+        else:
+            dispatch_mode = "sep"
+
+        neg_kk = kka = None
+        if dispatch_mode != "kkag":
+            k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
 
         if layer == 0:
             v_first = v
@@ -563,16 +680,22 @@ class RWKV7:
                 v12 = self.linear_rank_out(self.linear_rank_in(xv, z.get(p+"v1"), z.get(p+"v1.t"), path.rows), z.get(p+"v2"), z.get(p+"v2.t"), path.rows)
                 v = ops.tmix_vres_gate(B, T, C, v.contiguous(), v_first.contiguous(), z[p+"v0"], v12.contiguous())
 
+        y_wkv = torch.empty_like(r)
         y = torch.empty_like(r)
-        if WKV_MODE == "fp32io16":
-            w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
-            torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
-        elif T <= 16:
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
+        if dispatch_mode == "kkag":
+            torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_kkag_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"], y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
+        elif dispatch_mode == "lnx":
+            torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
         else:
-            w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
-        y = ops.tmix_lnx_rkvres_xg(B, T, C, H, y.contiguous(), r.contiguous(), k.contiguous(), v.contiguous(), z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous())
+            if WKV_MODE == "fp32io16":
+                w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
+                torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv)
+            elif T <= 16:
+                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t)
+            else:
+                w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
+                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t)
+            y = ops.tmix_lnx_rkvres_xg(B, T, C, H, y_wkv.contiguous(), r.contiguous(), k.contiguous(), v.contiguous(), z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous())
         return self.linear_orig_layout(y, z[p+"output.weight"], path, "att_c2c"), v_first
 
     def cmix(self, x: torch.Tensor, shift_state: torch.Tensor, p: str, path: PathConfig) -> torch.Tensor:
@@ -581,36 +704,70 @@ class RWKV7:
         B, T, _ = x.shape
 
         if path.cmix_mode == CMIX_B1T1_SPARSE:
-            return ops.cmix_sparse_one(C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
+            vw = self._dequant_nf4_value(z[p+"value.weight"])
+            return ops.cmix_sparse_one(C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], vw)
         if path.cmix_mode == CMIX_ROWS2_SPARSE:
-            return ops.cmix_sparse_rows(B, T, C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
+            vw = self._dequant_nf4_value(z[p+"value.weight"])
+            return ops.cmix_sparse_rows(B, T, C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], vw)
 
         mixed = ops.cmix_mix(B, T, C, x.contiguous(), shift_state[1], z[p+"x_k"])
         return self.cmix_from_mixed(mixed, p, path)
+
+    def _dequant_nf4_value(self, vw: torch.Tensor) -> torch.Tensor:
+        """Dequant NVFP4 value.weight to fp16 for non-NF4 cmix paths (auto mode)."""
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(vw))
+            if b_scale is not None:
+                t_scale = self.nf4_t_scales.get(id(vw), 1.0)
+                return torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(vw, b_scale, t_scale, False)
+        return vw
 
     def cmix_from_mixed(self, mixed: torch.Tensor, p: str, path: PathConfig) -> torch.Tensor:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
         hid = self.linear_orig_layout(mixed, z[p+"key.weight"], path, "ffn_key")
+        vw = z[p+"value.weight"]
+        # NVFP4 value.weight: dispatch to NF4 cmix_sparse kernels
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales[id(vw)]
+            t_scale = self.nf4_t_scales[id(vw)]
+            nf4_ops = torch.ops.rwkv7_nf4_ops
+            F = vw.size(0)
+            if path.cmix_mode == CMIX_B1T1_NOFC:
+                return nf4_ops.cmix_sparse_down_relu_one_nf4(hid.view(-1).contiguous(), vw, b_scale, t_scale, C, F)
+            if path.cmix_mode == CMIX_ROWS2_NOFC:
+                if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
+                    return nf4_ops.cmix_sparse_down_relu_rows_t512_nf4(hid.contiguous(), vw, b_scale, t_scale, B, T, C, F)
+                return nf4_ops.cmix_sparse_down_relu_rows_nf4(hid.contiguous(), vw, b_scale, t_scale, B, T, C, F)
+            # dense path: dequant + cuBLAS
+            k = ops.relu_square(hid.contiguous())
+            return self.linear(k, vw)
+        # FP16 value.weight: original path
         if path.cmix_mode == CMIX_B1T1_NOFC:
-            return ops.cmix_sparse_down_relu_one(C, z[p+"value.weight"].size(0), hid.view(-1).contiguous(), z[p+"value.weight"])
+            return ops.cmix_sparse_down_relu_one(C, vw.size(0), hid.view(-1).contiguous(), vw)
         if path.cmix_mode == CMIX_ROWS2_NOFC:
-            F = z[p+"value.weight"].size(0)
+            F = vw.size(0)
             if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
-                return ops.cmix_sparse_down_relu_rows_t512(B, T, C, F, hid.contiguous(), z[p+"value.weight"])
-            return ops.cmix_sparse_down_relu_rows(B, T, C, F, hid.contiguous(), z[p+"value.weight"])
+                return ops.cmix_sparse_down_relu_rows_t512(B, T, C, F, hid.contiguous(), vw)
+            return ops.cmix_sparse_down_relu_rows(B, T, C, F, hid.contiguous(), vw)
 
         k = ops.relu_square(hid.contiguous())
-        return self.linear(k, z[p+"value.weight"])
+        return self.linear(k, vw)
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(weight))
+            if b_scale is not None:
+                t_scale = self.nf4_t_scales.get(id(weight), 1.0)
+                weight = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(weight, b_scale, t_scale, True)
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
         return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
+        # head.weight never quantized: LM head must stay FP16 for RL training stability
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
@@ -619,6 +776,25 @@ class RWKV7:
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
         if not use_orig_linear(group):
             return self.linear(x, weight)
+        # NVFP4 dispatch: uint8 weight -> NVFP4 kernel (same dispatch params as v3a FP16)
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(weight))
+            assert b_scale is not None, f"NVFP4 weight has no block scale (id={id(weight)})"
+            t_scale = self.nf4_t_scales.get(id(weight), 1.0)
+            if path.rows == 1:
+                # Optimized blk16 GEMV: uint2 vectorized, 1-warp, always K%16==0
+                return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row1_blk16_f16(x.contiguous(), weight, b_scale, t_scale, 4)
+            if path.rows == 2:
+                return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row2_blk16_f16(x.contiguous(), weight, b_scale, t_scale, 2)
+            # M>=3: use NVFP4 GEMM kernel for small M, dequant+cuBLAS for large M
+            if path.rows <= 12:
+                if group == "att_c2c":
+                    if C <= 1024:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, t_scale, 2, 2)
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, t_scale, 3, 2)
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, t_scale, 2, 4)
+            # Large M: dequant to fp16 and fall through to cuBLAS
+            weight = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(weight, b_scale, t_scale, False)
         if path.rows == 1:
             if group == "ffn_key":
                 if C == 2560:
@@ -905,6 +1081,9 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     def percentile(values: list[float], q: float) -> float:
         return float(torch.quantile(torch.tensor(values, dtype=torch.float64), q / 100.0).item())
 
+    # bench_case does its own graph capture — disable auto-graph to avoid conflict
+    old_graph_auto = os.environ.get("CUDA_GRAPH_AUTO", "1")
+    os.environ["CUDA_GRAPH_AUTO"] = "0"
     state = model.zero_state(B)
     token_device = "cpu" if model.emb_cpu else first_device()
     tokens = torch.arange(B*T, dtype=torch.long, device=token_device).view(B,T)
@@ -987,6 +1166,7 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         tok_s = B*T*1000.0 / p50
         print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
         print(f"csv,rwkv7_fast_v3a_pp,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+        os.environ["CUDA_GRAPH_AUTO"] = old_graph_auto
         return
 
     graph = torch.cuda.CUDAGraph()
@@ -1025,6 +1205,7 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     tok_s = B*T*1000.0 / p50
     print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
     print(f"csv,rwkv7_fast_v3a,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+    os.environ["CUDA_GRAPH_AUTO"] = old_graph_auto
 
 def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths: str) -> None:
     with open(eval_json, "r", encoding="utf-8") as f:
