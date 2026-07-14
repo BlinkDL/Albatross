@@ -1,6 +1,29 @@
 # Albatross : efficient RWKV inference engine
 
-UPDATE: faster3a_2607 is 1~20% faster than faster3a_2605 (only tuned for 7B).
+UPDATE: faster3a_2607 is faster than faster3a_2605 (only tuned for 7B).
+```
+RESULT B=1 T=1 iters=3 p10_ms=6.8555 p50_ms=6.8585 p90_ms=6.9575 tok_s_p50=145.80
+RESULT B=1 T=2 iters=3 p10_ms=7.1599 p50_ms=7.1634 p90_ms=7.2747 tok_s_p50=279.20
+RESULT B=1 T=4 iters=3 p10_ms=7.8409 p50_ms=7.8423 p90_ms=7.9429 tok_s_p50=510.05
+RESULT B=1 T=8 iters=3 p10_ms=8.4995 p50_ms=8.5142 p90_ms=8.5864 tok_s_p50=939.60
+RESULT B=1 T=16 iters=3 p10_ms=9.1115 p50_ms=9.1417 p90_ms=9.2668 tok_s_p50=1750.22
+RESULT B=1 T=32 iters=3 p10_ms=11.1366 p50_ms=11.1400 p90_ms=11.4407 tok_s_p50=2872.53
+RESULT B=1 T=64 iters=3 p10_ms=11.7409 p50_ms=11.7417 p90_ms=12.0255 tok_s_p50=5450.68
+RESULT B=1 T=128 iters=3 p10_ms=13.4755 p50_ms=13.4777 p90_ms=13.5614 tok_s_p50=9497.19
+RESULT B=1 T=256 iters=3 p10_ms=18.0144 p50_ms=18.0292 p90_ms=18.1396 tok_s_p50=14199.20
+RESULT B=2 T=1 iters=3 p10_ms=7.1551 p50_ms=7.1580 p90_ms=7.3194 tok_s_p50=279.41
+RESULT B=4 T=1 iters=3 p10_ms=7.8659 p50_ms=7.8844 p90_ms=7.9746 tok_s_p50=507.33
+RESULT B=8 T=1 iters=3 p10_ms=8.5023 p50_ms=8.5271 p90_ms=8.6361 tok_s_p50=938.19
+RESULT B=16 T=1 iters=3 p10_ms=9.1567 p50_ms=9.1705 p90_ms=9.4360 tok_s_p50=1744.72
+RESULT B=32 T=1 iters=3 p10_ms=11.1109 p50_ms=11.1118 p90_ms=11.3531 tok_s_p50=2879.83
+RESULT B=64 T=1 iters=3 p10_ms=11.6690 p50_ms=11.6721 p90_ms=11.8782 tok_s_p50=5483.15
+RESULT B=128 T=1 iters=3 p10_ms=13.4692 p50_ms=13.4731 p90_ms=13.6302 tok_s_p50=9500.42
+RESULT B=256 T=1 iters=3 p10_ms=19.4906 p50_ms=19.4907 p90_ms=19.6106 tok_s_p50=13134.48
+RESULT B=2 T=2 iters=3 p10_ms=7.8192 p50_ms=7.8250 p90_ms=7.9173 tok_s_p50=511.18
+RESULT B=4 T=4 iters=3 p10_ms=8.9666 p50_ms=8.9817 p90_ms=9.1138 tok_s_p50=1781.41
+RESULT B=8 T=8 iters=3 p10_ms=11.0728 p50_ms=11.0763 p90_ms=11.3068 tok_s_p50=5778.09
+RESULT B=16 T=16 iters=3 p10_ms=14.7504 p50_ms=14.7602 p90_ms=14.8634 tok_s_p50=17343.98
+```
 
 UPDATE: faster3b_2607 for MegaKernel B1T1 7B experiment (currently 3~5% faster, 155+ tps on 5090).
 
