@@ -1,8 +1,10 @@
 # Albatross : efficient RWKV inference engine
 
-UPDATE: faster3b_2607 for MegaKernel B1T1 7B experiment (currently 3+% faster, 155+ tps on 5090).
+UPDATE: faster3a_2607 is 1~20% faster than faster3a_2605.
 
-UPDATE: faster3a_2605 (currently fastest) is up to 40% faster than faster3_2605 for small B/T (for better performance, tune linear_orig_layout for your GPU).
+UPDATE: faster3b_2607 for MegaKernel B1T1 7B experiment (currently 3~5% faster, 155+ tps on 5090).
+
+UPDATE: faster3a_2605 (please use it as reference) is up to 40% faster than faster3_2605 for small B/T (for better performance, tune linear_orig_layout for your GPU).
 ```
 RESULT B=1 T=1 iters=3 p10_ms=6.9425 p50_ms=6.9427 p90_ms=7.1073 tok_s_p50=144.04
 RESULT B=1 T=2 iters=3 p10_ms=7.2224 p50_ms=7.2231 p90_ms=7.3045 tok_s_p50=276.89
