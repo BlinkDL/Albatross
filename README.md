@@ -1,6 +1,6 @@
 # Albatross : efficient RWKV inference engine
 
-UPDATE: faster3a_2607 is 1~20% faster than faster3a_2605.
+UPDATE: faster3a_2607 is 1~20% faster than faster3a_2605 (only tuned for 7B).
 
 UPDATE: faster3b_2607 for MegaKernel B1T1 7B experiment (currently 3~5% faster, 155+ tps on 5090).
 
