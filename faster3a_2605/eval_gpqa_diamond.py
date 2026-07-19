@@ -100,8 +100,8 @@ def load_tasks(dataset: str, split: str, limit: int) -> list[Task]:
 
 
 def prompt(task: Task) -> str:
-    return f"User: {task.problem}\n\nAssistant: <think" # !!! Default !!! avg 36+%
-    # return f"User✿{task.problem}✿\nBot✿<think" # !!! Better !!! avg 37+%
+    return f"User✿{task.problem}✿\nBot✿<think" # !!! Better !!! avg 37+% for G1i-training 7B, avg 50+% for G1i-training 13B
+    # return f"User: {task.problem}\n\nAssistant: <think" # !!! Default !!! avg 36+% for G1i-training 7B, avg 49+% for G1i-training 13B
     # return f"User: {task.problem}\n\nAssistant: <think></think" # !!! Fast !!!
 
 
