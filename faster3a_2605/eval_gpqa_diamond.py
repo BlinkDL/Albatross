@@ -17,11 +17,19 @@ from rwkv.utils import PIPELINE
 
 ROOT = Path(__file__).resolve().parent
 LETTERS = "ABCD"
+ANSWER_MARKUP = re.compile(r"\*\*|__|`")
 ANSWER_PATTERNS = (
     re.compile(r"\\boxed\s*\{\s*(?:\\(?:text|mathrm)\s*\{\s*)?\(?\s*([ABCD])\s*\)?\s*\}?\s*\}", re.I),
-    re.compile(r"(?:final\s+answer|correct\s+answer|answer)\s*(?:(?:choice|option)\s*)?(?:is\s*|[:=]\s*)(?:(?:choice|option)\s*)?\(?\s*([ABCD])\s*\)?", re.I),
-    re.compile(r"(?:(?:choice|option)\s*)?\(?\s*([ABCD])\s*\)?\s+is\s+(?:the\s+)?(?:final\s+|correct\s+)?answer", re.I),
+    re.compile(r"(?i:(?:final\s+answer|correct\s+answer|answer)\s*(?:(?:choice|option)\s*)?(?:is\s*|[:=]\s*)(?:(?:choice|option)\s*)?\(?\s*)([A-D])(?i:\s*\)?)"),
+    re.compile(r"(?i:(?:(?:choice|option)\s*)?\(?\s*)([A-D])(?i:\s*\)?\s+is\s+(?:the\s+)?(?:final\s+|correct\s+)?answer)"),
 )
+ANSWER_FALLBACK_PATTERNS = (
+    re.compile(r"(?i:\b(?:choose|select|pick)\s+(?:(?:choice|option|answer)\s*)?[:=]?\s*\(?\s*)([A-D])(?i:\s*\)?\b)"),
+    re.compile(r"(?i:\b(?:corresponds?|maps?)\s+to\s+(?:(?:choice|option|answer)\s*)?\(?\s*)([A-D])(?i:\s*\)?\b)"),
+    re.compile(r"(?i:\b(?:therefore|thus|hence|so|consequently)[,:]?\s+(?:the\s+)?(?:(?:correct|final)\s+)?(?:answer|choice|option)\s+(?:is|would\s+be)\s+\(?\s*)([A-D])(?i:\s*\)?\b)"),
+    re.compile(r"(?i:\b\(?\s*)([A-D])(?i:\s*\)?\s+(?:is|would\s+be)\s+(?:the\s+)?(?:best|correct|final)\s+(?:answer|choice|option)\b)"),
+)
+THINK_FINAL_PATTERN = re.compile(r"(?i:\b(?:final\s+answer|correct\s+(?:answer|choice|option))\s*(?:is\s*|[:=]\s*)?(?:\\boxed\s*\{\s*)?(?:\\(?:text|mathrm)\s*\{\s*)?\(?\s*)([A-D])(?i:\s*\)?)")
 
 
 @dataclass(frozen=True)
@@ -68,17 +76,29 @@ def parse_args() -> argparse.Namespace:
     return a
 
 
+def last_answer(text: str, patterns: tuple[re.Pattern[str], ...]) -> str | None:
+    matches = [(m.start(), m.group(1).upper()) for pattern in patterns for m in pattern.finditer(text)]
+    return max(matches, key=lambda item: item[0])[1] if matches else None
+
+
 def extract_answer(text: str, require_think_close: bool = False) -> str | None:
     if require_think_close and "</think>" not in text:
         return None
-    answer_text = text.rsplit("</think>", 1)[-1]
-    matches = [(m.start(), m.group(1).upper()) for pattern in ANSWER_PATTERNS for m in pattern.finditer(answer_text)]
-    if matches:
-        return max(matches, key=lambda item: item[0])[1]
+    before_think, think_closed, answer_text = text.rpartition("</think>")
+    answer_text = ANSWER_MARKUP.sub("", answer_text if think_closed else text)
+    answer = last_answer(answer_text, ANSWER_PATTERNS)
+    if answer is None:
+        answer = last_answer(answer_text, ANSWER_FALLBACK_PATTERNS)
+    if answer is not None:
+        return answer
     for line in reversed(answer_text.splitlines()):
         match = re.fullmatch(r"\s*(?:final\s+answer\s*[:=]?\s*)?[\[(]?([ABCD])[\])]?[.!]?\s*", line, re.I)
         if match:
             return match.group(1).upper()
+    if think_closed:
+        matches = list(THINK_FINAL_PATTERN.finditer(ANSWER_MARKUP.sub("", before_think)))
+        if matches:
+            return matches[-1].group(1).upper()
     return None
 
 
