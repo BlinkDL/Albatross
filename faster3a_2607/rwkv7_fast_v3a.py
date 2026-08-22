@@ -23,6 +23,67 @@ L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
 WKV_FP16_POLICY = "tuned"
 WKV_BH_GRID_MODE = "tuned"
+# DeltaLog is opt-in because append phases intentionally keep wkv_state as a
+# physical base. A caller must execute a complete static 0..M-1 cycle before
+# treating state as materialized or exposing it to clone/reorder/save logic.
+WKV_DELTALOG_M = 0
+WKV_DELTALOG_PHASE = 0
+WKV_DELTALOG_WORKSPACE_LAYOUT = "separate"
+# Exact BnT1 gates confirmed positive in both graph-capture orders on 107.
+# C4096 entries are the conservative intersection of the 7.2B and 13.3B runs.
+# Do not admit C1024/C2048/C2560 B128 to the ordinary table from the
+# single-layer component result:
+# adjacent phases keep that layer's logs in L2, while real decode separates them
+# by a complete model pass. Cold-cache NCU and full-model nsys both reject it.
+# B64/B128/B256 also compare against cp/direct/clone eager kernels respectively;
+# never interpolate a DeltaLog gate across the B=64 or B=128 dispatch boundary.
+WKV_DELTALOG_TUNED_M = {
+    (768, 16): 2,
+    (768, 32): 3,
+    (768, 64): 3,
+    (768, 128): 3,
+    (768, 256): 3,
+    (768, 512): 3,
+    (1024, 16): 2,
+    (1024, 32): 3,
+    (1024, 64): 3,
+    (1024, 256): 3,
+    (1024, 512): 3,
+    (2048, 8): 2,
+    (2048, 16): 3,
+    (2048, 32): 3,
+    (2048, 64): 3,
+    (2048, 256): 3,
+    (2048, 512): 4,
+    (2560, 8): 2,
+    (2560, 16): 3,
+    (2560, 32): 3,
+    (2560, 64): 3,
+    (2560, 256): 3,
+    (2560, 512): 4,
+    (4096, 8): 2,
+    (4096, 16): 3,
+    (4096, 32): 3,
+    (4096, 64): 3,
+    (4096, 128): 3,
+    (4096, 256): 3,
+    (4096, 512): 4,
+}
+# APW-only gates compare a model-packed workspace against the existing
+# per-layer DeltaLog graph. They require the graph hook below; never fold the
+# B128-only admissions into WKV_DELTALOG_TUNED_M, where eager callers would run
+# them with cold logs. Values are (M, layout, protected region).
+WKV_DELTALOG_APW_TUNED = {
+    (768, 32): (3, "model_slot_packed", "full"),
+    (768, 64): (3, "model_slot_packed", "full"),
+    (768, 128): (3, "model_slot_packed", "slot0"),
+    (768, 256): (3, "model_slot_packed", "full"),
+    (1024, 32): (3, "model_slot_packed", "full"),
+    (1024, 64): (3, "model_slot_packed", "slot0"),
+    (1024, 128): (3, "model_slot_layer_packed", "full"),
+    (2048, 64): (3, "model_slot_layer_packed", "slot0"),
+    (2048, 128): (3, "model_slot_packed", "slot0"),
+}
 ADD_VEC_MODE = "tuned"
 LAST_LN_MODE = "indexed"
 LNX_MODE = "tuned"
@@ -459,13 +520,18 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
-    parser.add_argument("--cases", default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16") # try 1x1024 1024x1 32x32 for extreme tps
+    parser.add_argument(
+        "--cases", default="",
+        help="comma-separated BxT cases; defaults to the standard grid, or all tuned BnT1 batches with --deltalog")
     parser.add_argument("--profile-range", action="store_true")
     parser.add_argument("--eval-json", default="")
     parser.add_argument("--eval-out", default="")
     parser.add_argument("--eval-all-logits-out", default="")
     parser.add_argument("--eval-paths", default="b1tn")
     parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp32io16 is more accurate
+    parser.add_argument(
+        "--deltalog", action="store_true",
+        help="use the fastest strictly gated DeltaLog path for FP16 BnT1")
     parser.add_argument("--wkv-fp16-policy", choices=("current", "tuned"), default=WKV_FP16_POLICY)
     parser.add_argument("--wkv-bh-grid", choices=("current", "tuned"), default=WKV_BH_GRID_MODE)
     parser.add_argument("--add-vec", choices=("current", "tuned"), default=ADD_VEC_MODE)
@@ -546,19 +612,39 @@ def main() -> None:
     LOWRANK_GEMM_MODE = args.lowrank_gemm
     ORIG_LINEAR_GROUPS = parse_orig_linear_groups(args.orig_linear_groups)
     PP_DEVICES = parse_pp_devices(args.pp_devices)
+    if args.deltalog and WKV_MODE != "fp16":
+        parser.error("--deltalog requires --wkv fp16")
+    if args.deltalog and len(PP_DEVICES) > 1:
+        parser.error("--deltalog does not support pipeline parallel execution")
+    if args.deltalog and args.eval_json:
+        parser.error("--deltalog is BnT1-only; the CLI eval paths use B1 and are not tuned")
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} deltalog={'on' if args.deltalog else 'off'} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS} t512_acc2=exact_BT t512_reuse=exact_BT")
     load_extensions(WKV_MODE)
     model = RWKV7()
     if args.eval_json:
         run_eval(model, args.eval_json, args.eval_out, args.eval_all_logits_out, args.eval_paths)
         return
+    case_spec = args.cases
+    if not case_spec:
+        if args.deltalog:
+            tuned_batches = sorted({
+                B for channels, B in set(WKV_DELTALOG_TUNED_M) | set(WKV_DELTALOG_APW_TUNED)
+                if channels == C
+            })
+            if not tuned_batches:
+                parser.error(f"no tuned DeltaLog CLI cases for C={C}")
+            case_spec = ",".join(f"{B}x1" for B in tuned_batches)
+        else:
+            case_spec = "1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16"
     print("csv_header,label,B,T,iters,p10_ms,p50_ms,p90_ms,tok_s_p50", flush=True)
-    for item in args.cases.replace(",", " ").split():
+    for item in case_spec.replace(",", " ").split():
         B, T = [int(x) for x in item.lower().split("x", 1)]
-        bench_case(model, B, T, args.warmup, args.iters, args.profile_range)
+        bench_case(
+            model, B, T, args.warmup, args.iters, args.profile_range,
+            deltalog=args.deltalog)
 
 
 def use_wkv_bh_grid_2d(B: int, T: int, C: int, H: int) -> bool:
@@ -906,6 +992,20 @@ def load_extensions(wkv_mode: str = "fp16") -> None:
     load(name="rwkv7_fast_ops_fp16", sources=[str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"), str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu")], is_python_module=False, verbose=True, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
     if wkv_mode == "fp16":
         load(name="rwkv7_wkv_fp16_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cu")], is_python_module=False, verbose=True, extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas", "-O3"])
+        load(
+            name="rwkv7_wkv_deltalog_v3a",
+            sources=[
+                str(CUDA_DIR / "rwkv7_wkv_deltalog_v3a.cpp"),
+                str(CUDA_DIR / "rwkv7_wkv_deltalog_v3a.cu"),
+            ],
+            is_python_module=False,
+            verbose=True,
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=[
+                "-O3", "-res-usage", "--extra-device-vectorization",
+                "-Xptxas", "-O3",
+            ],
+        )
     elif wkv_mode == "fp32io16":
         load(name="rwkv7_wkv_fp32_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cu")], is_python_module=False, verbose=True, extra_cflags=["-O3", "-D_IO_FP16_"], extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas", "-O3", "-D_IO_FP16_"])
     else:
@@ -1040,9 +1140,51 @@ class RWKV7:
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.batch_rows_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self.wkv_deltalog_workspace: dict[
+            tuple[int, int, int, str], tuple[torch.Tensor, ...]
+        ] = {}
+        self.wkv_deltalog_sessions: dict[int, tuple[int, int, str] | None] = {}
         sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
         log(cuda_mem())
+
+    def deltalog_workspace(
+        self,
+        layer: int,
+        wkv_state: torch.Tensor,
+        B: int,
+        merge_interval: int,
+        layout: str | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        selected_layout = layout or WKV_DELTALOG_WORKSPACE_LAYOUT
+        if selected_layout not in (
+            "separate", "model_slot_packed", "model_slot_layer_packed",
+        ):
+            raise RuntimeError(
+                f"unsupported DeltaLog workspace layout: {selected_layout}")
+        if selected_layout != "separate":
+            if pp_enabled():
+                raise RuntimeError("model-packed DeltaLog does not support PP")
+            state_key = wkv_state.untyped_storage().data_ptr()
+        else:
+            state_key = wkv_state.data_ptr()
+        key = (state_key, B, merge_interval, selected_layout)
+        workspace = self.wkv_deltalog_workspace.get(key)
+        if workspace is None:
+            shape = (merge_interval - 1, B, C)
+            options = dict(device=wkv_state.device, dtype=torch.float16)
+            if selected_layout == "separate":
+                workspace = tuple(torch.empty(shape, **options) for _ in range(5))
+            elif selected_layout == "model_slot_packed":
+                workspace = (
+                    torch.empty((merge_interval - 1, 5, L, B, C), **options),
+                )
+            else:
+                workspace = (
+                    torch.empty((merge_interval - 1, L, 5, B, C), **options),
+                )
+            self.wkv_deltalog_workspace[key] = workspace
+        return workspace
 
     def zero_state(self, B: int) -> list[torch.Tensor]:
         if pp_enabled():
@@ -1059,6 +1201,220 @@ class RWKV7:
             torch.zeros((L,B,H,N,N), dtype=torch.float32 if WKV_MODE == "fp32io16" else DTYPE, device="cuda"),
             torch.zeros((B,), dtype=torch.int32, device="cuda"),
         ]
+
+    def deltalog_tuned_merge_interval(self, B: int) -> int:
+        return WKV_DELTALOG_TUNED_M.get((C, B), 0)
+
+    def deltalog_apw_policy(self, B: int) -> tuple[int, str, str] | None:
+        return WKV_DELTALOG_APW_TUNED.get((C, B))
+
+    def _select_deltalog_path(
+        self, B: int, merge_interval: int | None, apw: bool
+    ) -> tuple[int, str]:
+        if apw:
+            policy = self.deltalog_apw_policy(B)
+            if policy is None:
+                raise ValueError(f"no tuned APW DeltaLog path for C={C} B={B}")
+            selected_m, layout, _ = policy
+            if merge_interval is not None and merge_interval != selected_m:
+                raise ValueError(
+                    f"APW DeltaLog requires M={selected_m} for C={C} B={B}")
+            return selected_m, layout
+        return merge_interval or self.deltalog_tuned_merge_interval(B), "separate"
+
+    def deltalog_extra_bytes(self, B: int, merge_interval: int) -> int:
+        if merge_interval not in (2, 3, 4, 6, 8):
+            raise ValueError("DeltaLog merge interval must be one of 2,3,4,6,8")
+        return 5 * (merge_interval - 1) * B * C * DTYPE.itemsize * L
+
+    def deltalog_state_materialized(self, state: list[torch.Tensor]) -> bool:
+        if pp_enabled():
+            return False
+        session = self.wkv_deltalog_sessions.get(
+            state[1].data_ptr(), (0, 0, "separate"))
+        return session is not None and session[1] == 0
+
+    def forward_deltalog_step(
+        self,
+        tokens: torch.Tensor,
+        state: list[torch.Tensor],
+        merge_interval: int | None = None,
+        apw: bool = False,
+    ) -> torch.Tensor:
+        """Run one autoregressive token while preserving DeltaLog phase state."""
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(1)
+        if tokens.dim() != 2 or tokens.size(1) != 1:
+            raise ValueError("forward_deltalog_step requires [B,1] tokens")
+        x = self.embed(tokens)
+        return self.forward_from_x_deltalog_step(
+            x, state, select_path(tokens.size(0), 1), merge_interval, apw)
+
+    def forward_from_x_deltalog_step(
+        self,
+        x: torch.Tensor,
+        state: list[torch.Tensor],
+        path: PathConfig,
+        merge_interval: int | None = None,
+        apw: bool = False,
+    ) -> torch.Tensor:
+        """Run one T1 DeltaLog phase from a device-resident activation."""
+        global WKV_DELTALOG_M, WKV_DELTALOG_PHASE, WKV_DELTALOG_WORKSPACE_LAYOUT
+        if pp_enabled():
+            raise RuntimeError("DeltaLog does not support pipeline parallel state")
+        if x.dim() != 3 or x.size(1) != 1 or x.size(2) != C:
+            raise ValueError("forward_from_x_deltalog_step requires [B,1,C] x")
+        B = x.size(0)
+        selected_m, selected_layout = self._select_deltalog_path(
+            B, merge_interval, apw)
+        if selected_m not in (2, 3, 4, 6, 8):
+            raise ValueError(f"no tuned DeltaLog path for C={C} B={B}")
+
+        state_key = state[1].data_ptr()
+        session = self.wkv_deltalog_sessions.get(
+            state_key, (selected_m, 0, selected_layout))
+        if session is None:
+            raise RuntimeError("DeltaLog state was invalidated by an interrupted cycle")
+        active_m, phase, active_layout = session
+        if phase and (active_m != selected_m or active_layout != selected_layout):
+            raise RuntimeError("cannot change DeltaLog path inside a cycle")
+
+        previous_m = WKV_DELTALOG_M
+        previous_phase = WKV_DELTALOG_PHASE
+        previous_layout = WKV_DELTALOG_WORKSPACE_LAYOUT
+        WKV_DELTALOG_M = selected_m
+        WKV_DELTALOG_PHASE = phase
+        WKV_DELTALOG_WORKSPACE_LAYOUT = selected_layout
+        try:
+            logits = self.forward_from_x(x, state, path)
+        except Exception as exc:
+            # A failed append may leave physical state and logs out of sync.
+            self.wkv_deltalog_sessions[state_key] = None
+            raise RuntimeError("DeltaLog step failed; discard this state") from exc
+        finally:
+            WKV_DELTALOG_M = previous_m
+            WKV_DELTALOG_PHASE = previous_phase
+            WKV_DELTALOG_WORKSPACE_LAYOUT = previous_layout
+        self.wkv_deltalog_sessions[state_key] = (
+            selected_m, (phase + 1) % selected_m, selected_layout)
+        return logits
+
+    def forward_deltalog_cycle(
+        self,
+        tokens: torch.Tensor,
+        state: list[torch.Tensor],
+        merge_interval: int | None = None,
+        all_logits: bool = False,
+        apw: bool = False,
+    ) -> torch.Tensor:
+        """Run one complete teacher-forcing cycle and return materialized state."""
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        if tokens.dim() != 2:
+            raise ValueError("forward_deltalog_cycle requires [B,M] tokens")
+        x = self.embed(tokens)
+        return self.forward_from_x_deltalog_cycle(
+            x, state, select_path(tokens.size(0), 1), merge_interval,
+            all_logits=all_logits, apw=apw)
+
+    def forward_from_x_deltalog_cycle(
+        self,
+        x: torch.Tensor,
+        state: list[torch.Tensor],
+        path: PathConfig,
+        merge_interval: int | None = None,
+        all_logits: bool = False,
+        apw: bool = False,
+    ) -> torch.Tensor:
+        """Run a complete DeltaLog cycle from one or M device activations."""
+        if x.dim() != 3 or x.size(2) != C:
+            raise ValueError("forward_from_x_deltalog_cycle requires [B,T,C] x")
+        selected_m, _ = self._select_deltalog_path(
+            x.size(0), merge_interval, apw)
+        if x.size(1) not in (1, selected_m):
+            raise ValueError("cycle x must contain one shared or M phase activations")
+        if not self.deltalog_state_materialized(state):
+            raise RuntimeError("DeltaLog cycle must start from materialized state")
+        outputs = []
+        for phase in range(selected_m):
+            phase_x = x if x.size(1) == 1 else x[:, phase:phase + 1]
+            logits = self.forward_from_x_deltalog_step(
+                phase_x, state, path, selected_m, apw=apw)
+            if all_logits:
+                outputs.append(logits)
+        if not self.deltalog_state_materialized(state):
+            raise RuntimeError("DeltaLog cycle did not materialize state")
+        return torch.stack(outputs, dim=1) if all_logits else logits
+
+    def instantiate_deltalog_apw_graph(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        state: list[torch.Tensor],
+        B: int,
+        merge_interval: int | None = None,
+    ) -> dict[str, int | float | str]:
+        """Attach the tuned APW to a kept raw graph, then instantiate its exec."""
+        if pp_enabled():
+            raise RuntimeError("APW DeltaLog does not support pipeline parallel state")
+        selected_m, layout = self._select_deltalog_path(B, merge_interval, True)
+        if not self.deltalog_state_materialized(state):
+            raise RuntimeError("APW graph must end at a materialized DeltaLog phase")
+        state_key = state[1].untyped_storage().data_ptr()
+        workspace_key = (state_key, B, selected_m, layout)
+        workspace_tuple = self.wkv_deltalog_workspace.get(workspace_key)
+        if workspace_tuple is None:
+            raise RuntimeError(
+                "capture a complete forward_deltalog_cycle(..., apw=True) before "
+                "instantiating its APW graph")
+        workspace = workspace_tuple[0]
+        policy = self.deltalog_apw_policy(B)
+        assert policy is not None
+        window_mode = policy[2]
+        window_bytes = workspace.nbytes
+        if window_mode == "slot0":
+            window_bytes = workspace[0].nbytes
+
+        ops = torch.ops.rwkv7_wkv_deltalog_v3a
+        info = tuple(int(value) for value in ops.apw_device_info(workspace))
+        if window_bytes > info[1] or window_bytes > info[2]:
+            raise RuntimeError(
+                f"APW window {window_bytes} exceeds device limits "
+                f"persisting={info[1]} window={info[2]}")
+        persisting_bytes = max(info[3], window_bytes)
+        ops.set_persisting_l2_limit(workspace, persisting_bytes)
+        ops.reset_persisting_l2_cache(workspace)
+        kernel_nodes = ops.set_graph_persisting_window(
+            graph.raw_cuda_graph(), workspace, window_bytes, 1.0)
+        # Correctness/performance-critical ordering: executable graphs snapshot
+        # kernel-node attributes here. Re-instantiation is required if replay or
+        # an earlier instantiate already created an executable without this APW.
+        graph.instantiate()
+        return {
+            "merge_interval": selected_m,
+            "layout": layout,
+            "window_mode": window_mode,
+            "workspace_bytes": workspace.nbytes,
+            "window_bytes": window_bytes,
+            "persisting_bytes": persisting_bytes,
+            "kernel_nodes": int(kernel_nodes),
+            "l2_bytes": info[0],
+        }
+
+    def release_deltalog_workspace(self, state: list[torch.Tensor]) -> None:
+        # A captured graph retains raw workspace addresses, not Python tensor
+        # ownership. The caller must destroy every graph using this state before
+        # release, or a later allocation may reuse memory still named by a graph.
+        if not self.deltalog_state_materialized(state):
+            raise RuntimeError("cannot release DeltaLog logs inside a cycle")
+        wkv_state = state[1]
+        state_key = wkv_state.data_ptr()
+        state_end = state_key + wkv_state.numel() * wkv_state.element_size()
+        self.wkv_deltalog_sessions.pop(state_key, None)
+        for workspace_key in tuple(self.wkv_deltalog_workspace):
+            # Separate logs use each layer slice pointer; model-packed logs use
+            # this storage's base pointer. Both lie in the same state interval.
+            if state_key <= workspace_key[0] < state_end:
+                self.wkv_deltalog_workspace.pop(workspace_key)
 
     def forward(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
         if tokens.dim() == 1:
@@ -1326,7 +1682,34 @@ class RWKV7:
                         B, T, C, v_contig, v_first_contig, z[p+"v0"], v12_contig, vres_threads, True)
 
         y = torch.empty_like(r)
-        if WKV_MODE == "fp32io16":
+        if WKV_DELTALOG_M:
+            if WKV_MODE != "fp16" or T != 1 or WKV_DELTALOG_M not in (2, 3, 4, 6, 8):
+                raise RuntimeError("DeltaLog requires FP16 T1 and M in {2,3,4,6,8}")
+            if not 0 <= WKV_DELTALOG_PHASE < WKV_DELTALOG_M:
+                raise RuntimeError("DeltaLog phase is outside the active cycle")
+            # Correctness-critical: append phases do not update wkv_state.
+            # External state operations are legal only after phase M-1 merges.
+            log_workspace = self.deltalog_workspace(
+                layer, wkv_state, B, WKV_DELTALOG_M)
+            factor_args = (
+                r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(),
+                v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
+            if WKV_DELTALOG_WORKSPACE_LAYOUT in (
+                "model_slot_packed", "model_slot_layer_packed",
+            ):
+                packed_step = (
+                    torch.ops.rwkv7_wkv_deltalog_v3a.step_slot_packed
+                    if WKV_DELTALOG_WORKSPACE_LAYOUT == "model_slot_packed"
+                    else torch.ops.rwkv7_wkv_deltalog_v3a.step_slot_layer_packed
+                )
+                packed_step(
+                    B, C, H, L, layer, WKV_DELTALOG_M, WKV_DELTALOG_PHASE,
+                    wkv_state, log_workspace[0], *factor_args)
+            else:
+                torch.ops.rwkv7_wkv_deltalog_v3a.step(
+                    B, C, H, WKV_DELTALOG_M, WKV_DELTALOG_PHASE,
+                    wkv_state, *log_workspace, *factor_args)
+        elif WKV_MODE == "fp32io16":
             w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
             torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
         elif (wkv_override := wkv_fp16_path_override(B, T, C, H)) is not None:
@@ -1863,21 +2246,52 @@ class RWKV7:
     def add_last_ln(self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_last_layer_norm_f16(x.contiguous(), residual.contiguous(), weight, bias)
 
-def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_range: bool) -> None:
+def bench_case(
+    model: RWKV7,
+    B: int,
+    T: int,
+    warmup: int,
+    iters: int,
+    profile_range: bool,
+    deltalog: bool = False,
+) -> None:
     def percentile(values: list[float], q: float) -> float:
         return float(torch.quantile(torch.tensor(values, dtype=torch.float64), q / 100.0).item())
+
+    deltalog_m = 0
+    deltalog_apw = False
+    deltalog_layout = "separate"
+    if deltalog:
+        if WKV_MODE != "fp16" or pp_enabled():
+            raise ValueError("DeltaLog CLI requires single-device FP16")
+        if T != 1:
+            raise ValueError(f"DeltaLog CLI requires BnT1, got B={B} T={T}")
+        policy = model.deltalog_apw_policy(B)
+        if policy is not None:
+            deltalog_m, deltalog_layout, _ = policy
+            deltalog_apw = True
+        else:
+            deltalog_m = model.deltalog_tuned_merge_interval(B)
+        if deltalog_m == 0:
+            raise ValueError(f"no tuned DeltaLog CLI path for C={C} B={B}")
 
     state = model.zero_state(B)
     token_device = "cpu" if model.emb_cpu else first_device()
     tokens = torch.arange(B*T, dtype=torch.long, device=token_device).view(B,T)
     tokens = (tokens * 1103515245 + 12345) % V
     path = select_path(B, T)
-    x = model.embed(tokens) if (model.emb_cpu or pp_enabled()) else None
-    for _ in range(warmup):
+    x = model.embed(tokens) if (model.emb_cpu or pp_enabled() or deltalog) else None
+
+    def run_once():
+        if deltalog:
+            return model.forward_from_x_deltalog_cycle(
+                x, state, path, deltalog_m, apw=deltalog_apw)
         if x is None:
-            model.forward(tokens, state)
-        else:
-            model.forward_from_x(x, state, path)
+            return model.forward(tokens, state)
+        return model.forward_from_x(x, state, path)
+
+    for _ in range(warmup):
+        run_once()
     sync_all()
 
     if pp_enabled():
@@ -1951,21 +2365,28 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         print(f"csv,rwkv7_fast_v3a_pp,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
         return
 
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=deltalog_apw)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        if x is None:
-            model.forward(tokens, state)
-        else:
-            model.forward_from_x(x, state, path)
+        run_once()
     torch.cuda.current_stream().wait_stream(stream)
     with torch.cuda.graph(graph, stream=stream):
-        if x is None:
-            model.forward(tokens, state)
-        else:
-            model.forward_from_x(x, state, path)
+        run_once()
+    graph_info = None
+    if deltalog_apw:
+        graph_info = model.instantiate_deltalog_apw_graph(
+            graph, state, B, deltalog_m)
     torch.cuda.synchronize()
+
+    if deltalog:
+        mode = "apw" if deltalog_apw else "ordinary"
+        window = graph_info["window_mode"] if graph_info is not None else "none"
+        print(
+            f"DELTALOG B={B} T={T} M={deltalog_m} mode={mode} "
+            f"layout={deltalog_layout} window={window}",
+            flush=True,
+        )
 
     times = []
     if profile_range:
@@ -1977,7 +2398,8 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         graph.replay()
         end.record()
         torch.cuda.synchronize()
-        times.append(float(start.elapsed_time(end)))
+        elapsed_ms = float(start.elapsed_time(end))
+        times.append(elapsed_ms / deltalog_m if deltalog else elapsed_ms)
     if profile_range:
         torch.cuda.cudart().cudaProfilerStop()
 
@@ -1985,8 +2407,26 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     p50 = percentile(times, 50)
     p90 = percentile(times, 90)
     tok_s = B*T*1000.0 / p50
+    label = "rwkv7_fast_v3a"
+    if deltalog:
+        label += "_deltalog_apw" if deltalog_apw else "_deltalog"
     print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
-    print(f"csv,rwkv7_fast_v3a,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+    print(f"csv,{label},{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+
+    if deltalog_apw:
+        state_key = state[1].untyped_storage().data_ptr()
+        workspace = model.wkv_deltalog_workspace[
+            (state_key, B, deltalog_m, deltalog_layout)
+        ][0]
+        ops = torch.ops.rwkv7_wkv_deltalog_v3a
+        ops.set_persisting_l2_limit(workspace, 0)
+        ops.reset_persisting_l2_cache(workspace)
+    if deltalog:
+        # Graphs retain raw workspace pointers. Destroy the executable before
+        # releasing logs so allocator reuse cannot invalidate a live graph.
+        del graph
+        torch.cuda.synchronize()
+        model.release_deltalog_workspace(state)
 
 def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths: str) -> None:
     with open(eval_json, "r", encoding="utf-8") as f:
