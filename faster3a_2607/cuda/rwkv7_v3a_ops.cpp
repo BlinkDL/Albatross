@@ -136,14 +136,22 @@ torch::Tensor layer_norm_f16_cfg(
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
   check_half_cuda_contig(bias, "bias");
-  TORCH_CHECK(x.dim() >= 1 && x.size(-1) == 4096, "layer_norm_f16_cfg requires C=4096");
+  TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dim");
   TORCH_CHECK(x.numel() > 0, "layer_norm_f16_cfg requires at least one row");
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == 4096, "weight shape mismatch");
-  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 4096, "bias shape mismatch");
+  const int64_t c = x.size(-1);
+  TORCH_CHECK(c > 0 && c <= 8192, "unsupported C");
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
   TORCH_CHECK(x.get_device() == weight.get_device() && x.get_device() == bias.get_device(),
               "x, weight, and bias must be on the same CUDA device");
   TORCH_CHECK(threads == 128 || threads == 256 || threads == 512 || threads == 1024,
               "threads must be 128, 256, 512, or 1024");
+  if (vectorized) {
+    TORCH_CHECK((c % 2) == 0, "vectorized layer_norm_f16_cfg requires even C");
+    check_half2_aligned(x, "x");
+    check_half2_aligned(weight, "weight");
+    check_half2_aligned(bias, "bias");
+  }
   return layer_norm_f16_cfg_cuda(x, weight, bias, eps, static_cast<int>(threads), vectorized);
 }
 
@@ -517,15 +525,24 @@ std::vector<torch::Tensor> add_layer_norm_f16_cfg(
   check_half_cuda_contig(weight, "weight");
   check_half_cuda_contig(bias, "bias");
   TORCH_CHECK(x.sizes() == residual.sizes(), "add_layer_norm_f16_cfg x/residual shape mismatch");
-  TORCH_CHECK(x.dim() >= 1 && x.size(-1) == 4096, "add_layer_norm_f16_cfg requires C=4096");
+  TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dim");
   TORCH_CHECK(x.numel() > 0, "add_layer_norm_f16_cfg requires at least one row");
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == 4096, "weight shape mismatch");
-  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 4096, "bias shape mismatch");
+  const int64_t c = x.size(-1);
+  TORCH_CHECK(c > 0 && c <= 8192, "unsupported C");
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
   TORCH_CHECK(x.get_device() == residual.get_device() && x.get_device() == weight.get_device() &&
                   x.get_device() == bias.get_device(),
               "x, residual, weight, and bias must be on the same CUDA device");
   TORCH_CHECK(threads == 128 || threads == 256 || threads == 512 || threads == 1024,
               "threads must be 128, 256, 512, or 1024");
+  if (vectorized) {
+    TORCH_CHECK((c % 2) == 0, "vectorized add_layer_norm_f16_cfg requires even C");
+    check_half2_aligned(x, "x");
+    check_half2_aligned(residual, "residual");
+    check_half2_aligned(weight, "weight");
+    check_half2_aligned(bias, "bias");
+  }
   return add_layer_norm_f16_cfg_cuda(
       x, residual, weight, bias, eps, static_cast<int>(threads), vectorized);
 }
@@ -548,10 +565,12 @@ void add_layer_norm_f16_cfg_out(
   check_half_cuda_contig(y, "y");
   TORCH_CHECK(x.sizes() == residual.sizes() && x.sizes() == x_out.sizes() && x.sizes() == y.sizes(),
               "add_layer_norm_f16_cfg_out tensor shape mismatch");
-  TORCH_CHECK(x.dim() >= 1 && x.size(-1) == 4096, "add_layer_norm_f16_cfg_out requires C=4096");
+  TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dim");
   TORCH_CHECK(x.numel() > 0, "add_layer_norm_f16_cfg_out requires at least one row");
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == 4096, "weight shape mismatch");
-  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 4096, "bias shape mismatch");
+  const int64_t c = x.size(-1);
+  TORCH_CHECK(c > 0 && c <= 8192, "unsupported C");
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
   TORCH_CHECK(x.get_device() == residual.get_device() && x.get_device() == weight.get_device() &&
                   x.get_device() == bias.get_device() && x.get_device() == x_out.get_device() &&
                   x.get_device() == y.get_device(),
@@ -566,6 +585,15 @@ void add_layer_norm_f16_cfg_out(
               "x_out and y must not alias each other or any input");
   TORCH_CHECK(threads == 128 || threads == 256 || threads == 512 || threads == 1024,
               "threads must be 128, 256, 512, or 1024");
+  if (vectorized) {
+    TORCH_CHECK((c % 2) == 0, "vectorized add_layer_norm_f16_cfg_out requires even C");
+    check_half2_aligned(x, "x");
+    check_half2_aligned(residual, "residual");
+    check_half2_aligned(weight, "weight");
+    check_half2_aligned(bias, "bias");
+    check_half2_aligned(x_out, "x_out");
+    check_half2_aligned(y, "y");
+  }
   add_layer_norm_f16_cfg_out_cuda(
       x, residual, weight, bias, x_out, y, eps, static_cast<int>(threads), vectorized);
 }

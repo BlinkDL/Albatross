@@ -15,6 +15,10 @@ DTYPE = torch.float16
 MODEL_PATH = "/dev/shm/rwkv7-g1f-7.2b-20260414-ctx8192.pth"
 THIS_DIR = Path(__file__).resolve().parent
 CUDA_DIR = THIS_DIR / "cuda"
+CUTLASS_INCLUDE_DIR = Path(os.environ.get(
+    "CUTLASS_INCLUDE_DIR",
+    THIS_DIR.parents[1] / "third_party" / "cutlass" / "include",
+))
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
 WKV_FP16_POLICY = "tuned"
@@ -35,6 +39,37 @@ HEAD_ALL_LOGITS_GEMM_MODE = "tuned"
 HEAD_LAST_LOGITS_GEMM_MODE = "tuned"
 FFN_DOWN_GEMM_MODE = "tuned"
 ORIG_DENSE_GEMM_MODE = "tuned"
+ROWS_CUTLASS_MODE = "auto"
+ROWS_CUTLASS_AVAILABLE = False
+ROWS_CUTLASS_UP_4096 = frozenset((128, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192))
+ROWS_CUTLASS_DOWN_4096 = frozenset((128, 192, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192))
+ROWS_CUTLASS_UP_BY_C = {
+    768: frozenset((512, 2048, 3072, 4096, 6144, 8192)),
+    1024: frozenset((384, 512, 768, 1536, 2048, 3072, 4096, 6144, 8192)),
+    2048: frozenset((192, 256, 1024, 1536, 2048, 3072, 4096, 6144, 8192)),
+    # rows512 flipped with graph-capture order and is deliberately excluded.
+    2560: frozenset((192, 256, 384, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)),
+    4096: ROWS_CUTLASS_UP_4096,
+}
+# C768 rows768/1536 are stable only for the measured BnTn factorizations.
+# Their B1Tn cases flipped with capture order, so a rows-wide route is unsafe.
+ROWS_CUTLASS_UP_BT_BY_C = {
+    768: frozenset(((24, 32), (64, 12), (32, 48), (64, 24))),
+}
+ROWS_CUTLASS_DOWN_BY_C = {
+    768: frozenset((2048, 3072, 4096, 6144, 8192)),
+    1024: frozenset((1536, 2048, 3072, 4096, 6144, 8192)),
+    2048: frozenset((512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)),
+    2560: frozenset((2048, 3072, 4096, 6144, 8192)),
+    4096: ROWS_CUTLASS_DOWN_4096,
+}
+ROWS_CUTLASS_C2C_BY_C = {
+    768: frozenset((2048, 3072, 4096, 6144, 8192)),
+    1024: frozenset((1536, 2048, 3072, 4096, 6144, 8192)),
+    2048: frozenset((768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)),
+    2560: frozenset((768, 1024, 2048, 3072, 4096, 6144, 8192)),
+    4096: frozenset((1536, 2048, 3072, 4096, 6144, 8192)),
+}
 VRES_GATE_MODE = "tuned"
 EMB_DEVICE = "cpu"
 RKV_MODE = "off"
@@ -64,6 +99,23 @@ CMIX_VALUE_SPLIT2_BT_4096 = frozenset({
     (1, 5), (5, 1), (3, 2), (1, 7), (7, 1),
 })
 CMIX_T512_ACC2_BT_4096 = frozenset({(8, 1), (4, 2), (3, 3), (19, 1)})
+# Cross-width acc2 is an ILP/occupancy tradeoff, not a rows-wide property.
+# These exact B/T shapes were positive in both balanced eight-slot orders;
+# nearby factorizations flipped and must remain on one accumulator.
+CMIX_T512_ACC2_BT_BY_C = {
+    2048: frozenset({
+        (1, 8), (2, 4), (8, 1),
+        (12, 1),
+        (4, 4), (16, 1),
+    }),
+    2560: frozenset({
+        (1, 8), (2, 4),
+        (1, 12), (3, 4), (4, 3), (12, 1),
+        (1, 16), (2, 8), (4, 4), (8, 2), (16, 1),
+        (1, 19),
+    }),
+    4096: CMIX_T512_ACC2_BT_4096,
+}
 CMIX_T512_REUSE_BT_4096 = frozenset({
     (1, 8), (2, 4), (4, 2), (8, 1),
     (3, 3),
@@ -77,6 +129,30 @@ CMIX_T512_REUSE_BT_4096 = frozenset({
     (1, 19), (19, 1),
     (4, 5), (5, 4), (10, 2), (20, 1),
 })
+
+# Cross-width t512 mask-reuse winners from balanced eight-slot full-model E2E.
+# Keep these exact: nearby B/T factorizations at the same rows flipped sign.
+# C=768 never reaches the t512 kernel (C % 512 != 0); its apparent positive
+# slots were same-code noise and must not be restored or generalized by rows.
+CMIX_T512_REUSE_BT_BY_C = {
+    1024: frozenset({
+        (1, 16),
+        (19, 1),
+    }),
+    2048: frozenset({
+        (8, 1),
+        (1, 12), (3, 4), (4, 3), (12, 1),
+        (1, 16), (2, 8), (4, 4), (8, 2), (16, 1),
+        (1, 19), (19, 1),
+    }),
+    2560: frozenset({
+        (1, 8), (2, 4), (4, 2),
+        (1, 12), (3, 4), (4, 3), (12, 1),
+        (1, 16), (16, 1),
+        (1, 19), (19, 1),
+    }),
+    4096: CMIX_T512_REUSE_BT_4096,
+}
 
 # Current-environment all-logits head winners. These must not affect the usual
 # last-logits path: the same row count can mean either B or B*T. Lt indices are
@@ -115,6 +191,40 @@ HEAD_LAST_LOGITS_GEMM_4096 = {
     (192, 32): (0, 5),
 }
 
+# Cross-size candidates use the same strict (B,T) ownership rule as C=4096.
+# These entries intentionally remain exact: selecting by B alone is dangerous
+# because the head has B rows while the surrounding model body has B*T rows.
+# A fixed head saving can therefore turn into an E2E regression at another T.
+HEAD_LAST_LOGITS_GEMM_BY_C = {
+    768: {
+        (32, 4): (0, 0),
+        (32, 8): (0, 0),
+        (32, 16): (0, 0),
+        (32, 32): (0, 0),
+    },
+    1024: {
+        (4, 2): (0, 0),
+        (4, 4): (0, 0),
+        (4, 8): (0, 0),
+        (4, 16): (0, 0),
+        (16, 16): (32, 1),
+        (32, 4): (0, 0),
+        (32, 8): (0, 0),
+        (32, 16): (0, 0),
+        (32, 32): (0, 0),
+    },
+    2048: {
+        (32, 4): (0, 0),
+        (32, 8): (0, 0),
+        (32, 16): (0, 0),
+    },
+    2560: {
+        (32, 4): (0, 0),
+        (32, 16): (0, 0),
+    },
+    4096: HEAD_LAST_LOGITS_GEMM_4096,
+}
+
 # Runtime-layout FFN down winners on Blackwell/CUDA 13.2.  The heuristic index
 # is environment-specific, so the production op intentionally falls back to
 # algo 0 if an index disappears.  Exact shape/rows guards prevent accidental
@@ -124,11 +234,24 @@ FFN_DOWN_GEMM_4096 = {
     256: (32, 5),
 }
 
+# Cross-size runtime-layout FFN down winners from strict same-graph, full-layer
+# streams. Keep exact C/rows/shape guards: adjacent rows frequently select a
+# different Lt heuristic, and the heuristic index is environment-specific.
+FFN_DOWN_GEMM_BY_C = {
+    768: {256: (32, 2)},
+    1024: {64: (32, 1), 256: (32, 4), 1024: (0, 1)},
+    2048: {512: (128, 1)},
+    2560: {256: (32, 6), 512: (32, 1), 1024: (0, 0)},
+    4096: FFN_DOWN_GEMM_4096,
+}
+
 # Exact original-layout dense winners on Blackwell/CUDA 13.2.  These replace
 # severe heuristic cliffs in the older rows-range table.  Keep both the C/N/K
 # guards and the non-strict production Lt call: heuristic indices are not ABI
 # and may disappear after a CUDA, driver, or GPU change.
 ORIG_ATT_C2C_GEMM_4096 = {
+    8: ("lt", 128, 0),
+    16: ("lt", 32, 0),
     24: ("lt", 0, 0),
     32: ("gemmex", 0, 0),
     48: ("lt", 32, 0),
@@ -137,6 +260,8 @@ ORIG_ATT_C2C_GEMM_4096 = {
     192: ("lt", 32, 2),
 }
 ORIG_FFN_KEY_GEMM_4096 = {
+    8: ("lt", 32, 1),
+    16: ("lt", 128, 0),
     24: ("lt", 0, 2),
     32: ("lt", 0, 2),
     128: ("lt", 32, 3),
@@ -144,14 +269,120 @@ ORIG_FFN_KEY_GEMM_4096 = {
     384: ("lt", 0, 2),
 }
 
+# Strict same-graph winners measured over every layer of each real model.
+# These tables intentionally describe isolated exact rows rather than ranges:
+# old range dispatches contain large heuristic cliffs on the smaller widths.
+ORIG_ATT_C2C_GEMM_BY_C = {
+    768: {
+        8: ("lt", 32, 2),
+        16: ("lt", 32, 1),
+        32: ("lt", 32, 0),
+        1024: ("lt", 32, 1),
+    },
+    1024: {
+        8: ("lt", 128, 2),
+        16: ("lt", 128, 2),
+        32: ("lt", 32, 3),
+        64: ("lt", 32, 4),
+        128: ("lt", 128, 6),
+        512: ("lt", 128, 2),
+        1024: ("lt", 128, 1),
+    },
+    2048: {
+        8: ("lt", 32, 1),
+        16: ("lt", 128, 2),
+        32: ("lt", 32, 1),
+        64: ("lt", 32, 1),
+        1024: ("lt", 128, 0),
+    },
+    2560: {
+        8: ("lt", 32, 2),
+        16: ("lt", 128, 2),
+        32: ("lt", 128, 3),
+        512: ("lt", 128, 2),
+    },
+    4096: ORIG_ATT_C2C_GEMM_4096,
+}
+ORIG_FFN_KEY_GEMM_BY_C = {
+    768: {
+        8: ("lt", 0, 1),
+        16: ("lt", 0, 1),
+        64: ("lt", 32, 1),
+        512: ("lt", 0, 0),
+        1024: ("lt", 32, 5),
+    },
+    1024: {
+        8: ("lt", 0, 1),
+        16: ("lt", 0, 1),
+        32: ("lt", 32, 0),
+        64: ("lt", 0, 0),
+        512: ("lt", 128, 0),
+        1024: ("lt", 0, 3),
+    },
+    2048: {
+        32: ("lt", 32, 3),
+        256: ("lt", 128, 1),
+        512: ("lt", 0, 3),
+        1024: ("lt", 0, 1),
+    },
+    2560: {
+        32: ("lt", 0, 0),
+        512: ("lt", 128, 1),
+        1024: ("lt", 128, 0),
+    },
+    4096: ORIG_FFN_KEY_GEMM_4096,
+}
+
 # Exact B/T overrides admitted on the C=4096,H=64 model only. Keep this sparse:
 # WKV task supply depends on B*H while the recurrent critical path depends on T,
 # so neither a rows-only threshold nor cross-model reuse is justified.
 WKV_FP16_TUNED_OVERRIDES = {
-    (2, 32): ("fused", "exact"),
     (4, 16): ("fused", "exact"),
     (4, 64): ("fused", "exact"),
     (8, 8): ("fused", "exact"),
+}
+
+# Exact cross-width WKV paths admitted by dual capture-order full-model gates.
+# B controls (B*H) CTA supply while T controls the serial recurrence, so a
+# rows-only or C-range dispatch would silently choose the wrong launch shape.
+# The third field owns flat/2D launch independently of exact/seq and w0
+# materialization.  "auto" is reserved for T=1: forced APIs reject T<=1.
+WKV_FP16_PATH_OVERRIDES_BY_C = {
+    768: {
+        (1, 32): ("split", "exact", "2d"),
+        (2, 8): ("fused", "seq", "flat"),
+        (8, 4): ("fused", "exact", "2d"),
+        (8, 32): ("fused", "seq", "flat"),
+        (32, 1): ("fused", "auto", "2d"),
+    },
+    1024: {
+        (8, 32): ("fused", "seq", "flat"),
+        (16, 1): ("fused", "auto", "2d"),
+        (32, 1): ("fused", "auto", "2d"),
+    },
+    2048: {
+        (2, 8): ("fused", "seq", "flat"),
+        (8, 1): ("fused", "auto", "2d"),
+        (8, 2): ("fused", "exact", "2d"),
+        (16, 2): ("fused", "exact", "2d"),
+    },
+    2560: {
+        (1, 32): ("split", "exact", "2d"),
+        (2, 4): ("fused", "exact", "2d"),
+        (2, 8): ("fused", "seq", "flat"),
+        (4, 32): ("fused", "seq", "flat"),
+        (8, 32): ("fused", "seq", "flat"),
+        (32, 1): ("fused", "auto", "2d"),
+    },
+    4096: {
+        **{bt: (w0_mode, kernel_mode, "2d")
+           for bt, (w0_mode, kernel_mode) in WKV_FP16_TUNED_OVERRIDES.items()},
+        # This replaces the older fused/exact/2D owner at the same shape.
+        # Both capture orders were positive on both 7.2B and 13.3B; the flat
+        # seq path changes reduction association but keeps disjoint owners.
+        (2, 32): ("fused", "seq", "flat"),
+        (32, 1): ("fused", "auto", "2d"),
+    },
 }
 
 # Tuned table for the 4096-wide 7B model, admitted by real B/T E2E and eval_src2
@@ -223,7 +454,7 @@ LOWRANK_OUT_GEMM_4096 = {
 }
 
 def main() -> None:
-    global MODEL_PATH, WKV_MODE, WKV_FP16_POLICY, WKV_BH_GRID_MODE, ADD_VEC_MODE, LAST_LN_MODE, LNX_MODE, LN_OWNER_MODE, LN_STATS_MODE, CMIX_LN_STATS_MODE, CMIX_MIX_MODE, CMIX_VALUE_LOOP_MODE, CMIX_T512_ACCUM_MODE, CMIX_T512_REUSE_MODE, TMIX_MIX_MODE, HEAD_GRID_MODE, HEAD_ALL_LOGITS_GEMM_MODE, HEAD_LAST_LOGITS_GEMM_MODE, FFN_DOWN_GEMM_MODE, ORIG_DENSE_GEMM_MODE, VRES_GATE_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, LOWRANK_GEMM_MODE, ORIG_LINEAR_GROUPS, PP_DEVICES
+    global MODEL_PATH, WKV_MODE, WKV_FP16_POLICY, WKV_BH_GRID_MODE, ADD_VEC_MODE, LAST_LN_MODE, LNX_MODE, LN_OWNER_MODE, LN_STATS_MODE, CMIX_LN_STATS_MODE, CMIX_MIX_MODE, CMIX_VALUE_LOOP_MODE, CMIX_T512_ACCUM_MODE, CMIX_T512_REUSE_MODE, TMIX_MIX_MODE, HEAD_GRID_MODE, HEAD_ALL_LOGITS_GEMM_MODE, HEAD_LAST_LOGITS_GEMM_MODE, FFN_DOWN_GEMM_MODE, ORIG_DENSE_GEMM_MODE, ROWS_CUTLASS_MODE, VRES_GATE_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, LOWRANK_GEMM_MODE, ORIG_LINEAR_GROUPS, PP_DEVICES
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--warmup", type=int, default=1)
@@ -273,6 +504,9 @@ def main() -> None:
     parser.add_argument(
         "--orig-dense-gemm", choices=("current", "tuned"),
         default=ORIG_DENSE_GEMM_MODE)
+    parser.add_argument(
+        "--rows-cutlass", choices=("auto", "off", "tuned"),
+        default=ROWS_CUTLASS_MODE)
     parser.add_argument("--vres-gate", choices=("current", "tuned"), default=VRES_GATE_MODE)
     parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
     parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off") # auto is slightly faster but consumes lots of VRAM
@@ -303,6 +537,7 @@ def main() -> None:
     HEAD_LAST_LOGITS_GEMM_MODE = args.head_last_logits_gemm
     FFN_DOWN_GEMM_MODE = args.ffn_down_gemm
     ORIG_DENSE_GEMM_MODE = args.orig_dense_gemm
+    ROWS_CUTLASS_MODE = args.rows_cutlass
     VRES_GATE_MODE = args.vres_gate
     EMB_DEVICE = args.emb
     RKV_MODE = args.batched_rkv
@@ -313,7 +548,7 @@ def main() -> None:
     PP_DEVICES = parse_pp_devices(args.pp_devices)
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS} t512_acc2=exact_BT t512_reuse=exact_BT")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -352,6 +587,12 @@ def use_wkv_bh_grid_2d(B: int, T: int, C: int, H: int) -> bool:
     )
 
 
+def wkv_fp16_path_override(B: int, T: int, C: int, H: int):
+    if WKV_FP16_POLICY != "tuned" or C != H * 64:
+        return None
+    return WKV_FP16_PATH_OVERRIDES_BY_C.get(C, {}).get((B, T))
+
+
 def use_warp_lnx(B: int, T: int, C: int, H: int) -> bool:
     if LNX_MODE == "warp":
         return True
@@ -364,8 +605,29 @@ def use_warp_lnx(B: int, T: int, C: int, H: int) -> bool:
 def use_add_vec_2d(rows: int, channels: int) -> bool:
     return ADD_VEC_MODE == "tuned" and channels == 4096 and 17 <= rows <= 65535
 
+def tuned_add_ln_owner_config(rows: int, channels: int) -> tuple[int, bool] | None:
+    if LN_OWNER_MODE != "tuned":
+        return None
+    if channels == 4096 and rows < 1024:
+        return 256, True
+    # These exact large-row owners are bandwidth winners on the real C=2048
+    # and C=2560 model shapes. Do not broaden the rows guard: the same generic
+    # templates lose at rows<=512, often by more than their rows=1024 gain.
+    if rows == 1024 and channels == 2048:
+        return 256, True
+    if rows == 1024 and channels == 2560:
+        return 128, True
+    return None
+
 def use_tuned_ln_owner(rows: int, channels: int) -> bool:
-    return LN_OWNER_MODE == "tuned" and channels == 4096 and rows < 1024
+    return tuned_add_ln_owner_config(rows, channels) is not None
+
+def tuned_standalone_ln_config(rows: int, channels: int) -> tuple[int, bool] | None:
+    if LN_OWNER_MODE != "tuned" or rows != 1024:
+        return None
+    if channels in (2048, 2560):
+        return 256, True
+    return None
 
 def tuned_ln_stats_mode(batch: int, rows: int, channels: int) -> int | None:
     if LN_STATS_MODE == "current" or channels != 4096:
@@ -429,16 +691,22 @@ def use_cmix_value_split2(
 def cmix_t512_accumulators(
     batch: int, tokens: int, channels: int, hidden: int
 ) -> int:
-    if channels != 4096 or hidden != 16384:
+    if channels % 512 != 0 or hidden != 4 * channels:
         return 1
+    # Experimental force modes must be checked before the production width
+    # table. Putting the C4096 gate first silently turns cross-width A/B runs
+    # into acc1-vs-acc1 same-code measurements.
     if CMIX_T512_ACCUM_MODE == "acc2":
         return 2
     if CMIX_T512_ACCUM_MODE == "acc4":
         return 4
     # The fixed savings are only a few microseconds per full graph. Keep the
-    # production table exact: these four shapes survived two independent
-    # 8x5 rounds in both capture orders, while nearby B/T factorizations did not.
-    if CMIX_T512_ACCUM_MODE == "tuned" and (batch, tokens) in CMIX_T512_ACC2_BT_4096:
+    # production table exact: nearby B/T factorizations did not survive the
+    # balanced full-model gate, and the result is width-sensitive.
+    if (
+        CMIX_T512_ACCUM_MODE == "tuned" and
+        (batch, tokens) in CMIX_T512_ACC2_BT_BY_C.get(channels, ())
+    ):
         return 2
     return 1
 
@@ -454,8 +722,8 @@ def use_cmix_t512_reuse(
     # B/T-sensitive, so only exact shapes positive in both balanced slot orders
     # are admitted; nearby factorizations are intentionally not extrapolated.
     return (
-        channels == 4096 and hidden == 16384 and
-        (batch, tokens) in CMIX_T512_REUSE_BT_4096)
+        hidden == 4 * channels and
+        (batch, tokens) in CMIX_T512_REUSE_BT_BY_C.get(channels, ()))
 
 def use_tmix_mix6_3d(batch: int, tokens: int, channels: int) -> bool:
     if TMIX_MIX_MODE == "current" or tokens == 1:
@@ -644,6 +912,51 @@ def load_extensions(wkv_mode: str = "fp16") -> None:
         raise ValueError(f"unknown wkv_mode: {wkv_mode}")
     log(f"CUDA extensions loaded in {time.perf_counter() - t0:.3f}s")
 
+
+def load_rows_cutlass_extension() -> None:
+    global ROWS_CUTLASS_AVAILABLE
+    ROWS_CUTLASS_AVAILABLE = False
+    if (
+        ROWS_CUTLASS_MODE == "off"
+        or (
+            C not in ROWS_CUTLASS_UP_BY_C
+            and C not in ROWS_CUTLASS_DOWN_BY_C
+            and C not in ROWS_CUTLASS_C2C_BY_C
+        )
+    ):
+        return
+    if not CUTLASS_INCLUDE_DIR.is_dir():
+        message = f"CUTLASS headers not found at {CUTLASS_INCLUDE_DIR}"
+        if ROWS_CUTLASS_MODE == "tuned":
+            raise RuntimeError(message)
+        log(f"{message}; admitted rows fall back to cuBLAS")
+        return
+    t0 = time.perf_counter()
+    try:
+        load(
+            name="rwkv7_rows_cutlass",
+            sources=[
+                str(CUDA_DIR / "rwkv7_rows_cutlass.cpp"),
+                str(CUDA_DIR / "rwkv7_rows_cutlass.cu"),
+            ],
+            is_python_module=False,
+            verbose=True,
+            extra_include_paths=[str(CUTLASS_INCLUDE_DIR)],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas", "-O3"],
+        )
+    except Exception as exc:
+        if ROWS_CUTLASS_MODE == "tuned":
+            raise
+        log(f"rows CUTLASS build unavailable; fallback to cuBLAS: {str(exc).splitlines()[0]}")
+        return
+    ROWS_CUTLASS_AVAILABLE = True
+    log(
+        f"rows CUTLASS FFN kernels loaded in {time.perf_counter() - t0:.3f}s "
+        f"C={C} up={sorted(ROWS_CUTLASS_UP_BY_C.get(C, ()))} "
+        f"down={sorted(ROWS_CUTLASS_DOWN_BY_C.get(C, ()))} "
+        f"c2c={sorted(ROWS_CUTLASS_C2C_BY_C.get(C, ()))}")
+
 class RWKV7:
     def __init__(self) -> None:
         global L, C, H, N, V
@@ -665,6 +978,7 @@ class RWKV7:
         max_layer = max(int(k.split(".")[1]) for k in z.keys() if k.startswith("blocks."))
         L = max_layer + 1
         log(f"detected model C={C} H={H} N={N} V={V}")
+        load_rows_cutlass_extension()
         log(f"cmix no-fc path: rows<={cmix_nofc_max_rows()} row20_t<={cmix_nofc_row20_max_t()}")
 
         emb_src = z["emb.weight"].squeeze()
@@ -911,6 +1225,12 @@ class RWKV7:
         return rows
 
     def ln(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        rows = x.numel() // x.size(-1)
+        config = tuned_standalone_ln_config(rows, x.size(-1))
+        if config is not None:
+            threads, vectorized = config
+            return torch.ops.rwkv7_v3a_ops.layer_norm_f16_cfg(
+                x.contiguous(), weight, bias, 1.0e-5, threads, vectorized)
         return torch.ops.rwkv7_v3a_ops.layer_norm_f16(x.contiguous(), weight, bias)
 
     def forward_all_logits(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
@@ -1009,24 +1329,35 @@ class RWKV7:
         if WKV_MODE == "fp32io16":
             w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
             torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
-        elif WKV_FP16_POLICY == "tuned" and C == 4096 and H == 64 and (B, T) in WKV_FP16_TUNED_OVERRIDES:
-            w0_mode, kernel_mode = WKV_FP16_TUNED_OVERRIDES[(B, T)]
+        elif (wkv_override := wkv_fp16_path_override(B, T, C, H)) is not None:
+            w0_mode, kernel_mode, grid_mode = wkv_override
+            grid2d = grid_mode == "2d"
             forced_mode = 0 if kernel_mode == "exact" else 1
             if w0_mode == "fused":
-                wkv_op = (
-                    torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_grid2d_forced
-                    if use_wkv_bh_grid_2d(B, T, C, H)
-                    else torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_forced)
-                wkv_op(
-                    B, T, C, H, forced_mode, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"],
-                    k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
+                if kernel_mode == "auto":
+                    # T=1 must use auto: forced WKV APIs deliberately reject it.
+                    wkv_op = (
+                        torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_grid2d
+                        if grid2d else torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0)
+                    wkv_op(
+                        B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"],
+                        k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
+                else:
+                    wkv_op = (
+                        torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_grid2d_forced
+                        if grid2d else torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_forced)
+                    wkv_op(
+                        B, T, C, H, forced_mode, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"],
+                        k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
             else:
+                if kernel_mode == "auto":
+                    raise RuntimeError("split auto WKV override is not admitted")
                 w_contig = w.contiguous()
                 add_vec_op = ops.add_vec_2d if use_add_vec_2d(path.rows, C) else ops.add_vec
                 w_raw = add_vec_op(C, w_contig, z[p+"w0"])
                 wkv_op = (
                     torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_grid2d_forced
-                    if use_wkv_bh_grid_2d(B, T, C, H)
+                    if grid2d
                     else torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_forced)
                 wkv_op(
                     B, T, C, H, forced_mode, wkv_state, r.contiguous(), w_raw.contiguous(),
@@ -1103,14 +1434,21 @@ class RWKV7:
 
     def linear_ffn_down(self, x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
         if (
-            FFN_DOWN_GEMM_MODE == "tuned"
-            and C == 4096
-            and rows in FFN_DOWN_GEMM_4096
-            and tuple(weight.shape) == (16384, 4096)
+            ROWS_CUTLASS_AVAILABLE
+            and rows in ROWS_CUTLASS_DOWN_BY_C.get(C, ())
+            and tuple(weight.shape) == (4 * C, C)
         ):
-            workspace_mb, algo_index = FFN_DOWN_GEMM_4096[rows]
-            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
-                x.contiguous(), weight, workspace_mb, algo_index)
+            return torch.ops.rwkv7_rows_cutlass.linear_runtime(
+                x.contiguous(), weight, 15)
+        if (
+            FFN_DOWN_GEMM_MODE == "tuned"
+            and tuple(weight.shape) == (4 * C, C)
+        ):
+            cfg = FFN_DOWN_GEMM_BY_C.get(C, {}).get(rows)
+            if cfg is not None:
+                workspace_mb, algo_index = cfg
+                return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                    x.contiguous(), weight, workspace_mb, algo_index)
         return self.linear(x, weight)
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -1138,10 +1476,10 @@ class RWKV7:
         rows = x.numel() // C
         if (
             HEAD_LAST_LOGITS_GEMM_MODE == "tuned"
-            and C == 4096
-            and tuple(z["head.weight"].shape) == (65536, 4096)
+            and tuple(z["head.weight"].shape) == (V, C)
         ):
-            cfg = HEAD_LAST_LOGITS_GEMM_4096.get((rows, tokens_count))
+            cfg = HEAD_LAST_LOGITS_GEMM_BY_C.get(C, {}).get(
+                (rows, tokens_count))
             if cfg is not None:
                 workspace_mb, algo_index = cfg
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
@@ -1152,11 +1490,38 @@ class RWKV7:
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
         if not use_orig_linear(group):
             return self.linear(x, weight)
-        if ORIG_DENSE_GEMM_MODE == "tuned" and C == 4096:
-            if group == "att_c2c" and tuple(weight.shape) == (4096, 4096):
-                cfg = ORIG_ATT_C2C_GEMM_4096.get(path.rows)
-            elif group == "ffn_key" and tuple(weight.shape) == (16384, 4096):
-                cfg = ORIG_FFN_KEY_GEMM_4096.get(path.rows)
+        if (
+            ROWS_CUTLASS_AVAILABLE
+            and path.rows in ROWS_CUTLASS_C2C_BY_C.get(C, ())
+            and group == "att_c2c"
+            and tuple(weight.shape) == (C, C)
+            # C2560 B1T1024 flipped with graph capture order. Its three tested
+            # BnTn factorizations were positive in both orders. This exception
+            # is rows1024-only: B1T768/B1T2048 passed both orders and must not
+            # be accidentally sent back to the slower backend.
+            and (C != 2560 or path.rows != 1024 or (x.dim() >= 3 and x.size(0) > 1))
+        ):
+            return torch.ops.rwkv7_rows_cutlass.linear_orig(
+                x.contiguous(), weight, 12)
+        if (
+            ROWS_CUTLASS_AVAILABLE
+            and (
+                path.rows in ROWS_CUTLASS_UP_BY_C.get(C, ())
+                or (
+                    x.dim() >= 3
+                    and (x.size(0), x.size(1)) in ROWS_CUTLASS_UP_BT_BY_C.get(C, ())
+                )
+            )
+            and group == "ffn_key"
+            and tuple(weight.shape) == (4 * C, C)
+        ):
+            return torch.ops.rwkv7_rows_cutlass.linear_orig(
+                x.contiguous(), weight, 12)
+        if ORIG_DENSE_GEMM_MODE == "tuned":
+            if group == "att_c2c" and tuple(weight.shape) == (C, C):
+                cfg = ORIG_ATT_C2C_GEMM_BY_C.get(C, {}).get(path.rows)
+            elif group == "ffn_key" and tuple(weight.shape) == (4 * C, C):
+                cfg = ORIG_FFN_KEY_GEMM_BY_C.get(C, {}).get(path.rows)
             else:
                 cfg = None
             if cfg is not None:
@@ -1466,12 +1831,15 @@ class RWKV7:
         if stats_mode is not None:
             outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16_stats_cfg(
                 x.contiguous(), residual.contiguous(), weight, bias, 1.0e-5, stats_mode)
-        elif use_tuned_ln_owner(rows, x.size(-1)):
-            outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16_cfg(
-                x.contiguous(), residual.contiguous(), weight, bias, 1.0e-5, 256, True)
         else:
-            outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16(
-                x.contiguous(), residual.contiguous(), weight, bias)
+            owner_config = tuned_add_ln_owner_config(rows, x.size(-1))
+            if owner_config is not None:
+                threads, vectorized = owner_config
+                outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16_cfg(
+                    x.contiguous(), residual.contiguous(), weight, bias, 1.0e-5, threads, vectorized)
+            else:
+                outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16(
+                    x.contiguous(), residual.contiguous(), weight, bias)
         return outs[0], outs[1]
 
     def add_ln_cmix_mix(

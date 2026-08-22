@@ -229,6 +229,92 @@ __device__ __forceinline__ void prefetch_token(
   cp_commit();
 }
 
+__device__ __forceinline__ float warp_sum_float(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
+template <int RowsPerCta, bool AddW0>
+__global__ __launch_bounds__(RowsPerCta * 32, 1) void wkv_fp16_grouped_rows_kernel(
+    int T,
+    int C,
+    int H,
+    half* __restrict__ state_ptr,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ w_ptr,
+    const half* __restrict__ w0_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ y_ptr,
+    const int* __restrict__ elapsed_t) {
+  static_assert(RowsPerCta == 4 || RowsPerCta == 8 || RowsPerCta == 16);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * RowsPerCta + warp;
+  const int h = blockIdx.y;
+  const int b_id = blockIdx.z;
+  const int c0 = lane * 2;
+
+  const int64_t state_offset =
+      (static_cast<int64_t>(b_id) * H * N + h * N + row) * N + c0;
+  half2 state = __ldg(reinterpret_cast<const half2*>(state_ptr + state_offset));
+
+  __shared__ __align__(128) half2 r[HALF2_N];
+  __shared__ __align__(128) half2 w[HALF2_N];
+  __shared__ __align__(128) half2 k[HALF2_N];
+  __shared__ __align__(128) half2 a[HALF2_N];
+  __shared__ __align__(128) half2 bvec[HALF2_N];
+
+  for (int tt = 0; tt < T; ++tt) {
+    const int64_t token =
+        (static_cast<int64_t>(b_id) * T + tt) * C + h * N;
+    if (warp == 0) {
+      const int64_t idx = token + c0;
+      r[lane] = __ldg(reinterpret_cast<const half2*>(r_ptr + idx));
+      k[lane] = __ldg(reinterpret_cast<const half2*>(k_ptr + idx));
+      a[lane] = __ldg(reinterpret_cast<const half2*>(a_ptr + idx));
+      bvec[lane] = __ldg(reinterpret_cast<const half2*>(b_ptr + idx));
+      const half2 raw_w = __ldg(reinterpret_cast<const half2*>(w_ptr + idx));
+      const int phase = elapsed_t[b_id] + h * N + c0 + tt;
+      w[lane] = __halves2half2(
+          w_delta_maybe_w0<AddW0>(raw_w.x, w0_ptr, h * N + c0, phase),
+          w_delta_maybe_w0<AddW0>(raw_w.y, w0_ptr, h * N + c0 + 1, phase + 1));
+    }
+    __syncthreads();
+
+    const half2 av = a[lane];
+    const half2 product = __hmul2(state, av);
+    float sa = __half2float(product.x) + __half2float(product.y);
+    sa = warp_sum_float(sa);
+    sa = __shfl_sync(0xffffffffu, sa, 0);
+    const half2 sa2 = __float2half2_rn(sa);
+    const half vv = __ldg(v_ptr + token + row);
+    const half2 vv2 = __halves2half2(vv, vv);
+    state = __hfma2(
+        state,
+        w[lane],
+        __hfma2(k[lane], vv2, __hfma2(sa2, bvec[lane], state)));
+
+    const half2 yr = __hmul2(state, r[lane]);
+    float yy = __half2float(yr.x) + __half2float(yr.y);
+    yy = warp_sum_float(yy);
+    if (lane == 0) {
+      y_ptr[token + row] = __float2half_rn(yy);
+    }
+    // Every CTA reuses the shared token operands for the next recurrent step.
+    // Removing this barrier lets warp 0 overwrite data while peer row owners
+    // still consume it, which is a real cross-warp race for T > 1.
+    __syncthreads();
+  }
+
+  reinterpret_cast<half2*>(state_ptr + state_offset)[0] = state;
+}
+
 template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
     const int B,
@@ -905,6 +991,44 @@ void wkv_seq_w0_forced_v2_cuda(
   wkv_seq_v2_cuda_impl(
       B, T, C, H, state, r, w, reinterpret_cast<const half*>(w0.data_ptr()), true,
       k, v, a, b, y, elapsed_t, mode);
+}
+
+void wkv_grouped_w0_forced_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    int rows_per_cta,
+    at::Tensor state,
+    at::Tensor r,
+    at::Tensor w,
+    at::Tensor w0,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor y,
+    at::Tensor elapsed_t) {
+  assert(C == H * N);
+  auto stream = at::cuda::getCurrentCUDAStream();
+#define LAUNCH_GROUPED_ROWS(Rows) \
+  wkv_fp16_grouped_rows_kernel<Rows, true><<<dim3(N / Rows, H, B), dim3(Rows * 32), 0, stream>>>( \
+      T, C, H, reinterpret_cast<half*>(state.data_ptr()), \
+      reinterpret_cast<const half*>(r.data_ptr()), reinterpret_cast<const half*>(w.data_ptr()), \
+      reinterpret_cast<const half*>(w0.data_ptr()), reinterpret_cast<const half*>(k.data_ptr()), \
+      reinterpret_cast<const half*>(v.data_ptr()), reinterpret_cast<const half*>(a.data_ptr()), \
+      reinterpret_cast<const half*>(b.data_ptr()), reinterpret_cast<half*>(y.data_ptr()), \
+      elapsed_t.data_ptr<int>())
+  if (rows_per_cta == 4) {
+    LAUNCH_GROUPED_ROWS(4);
+  } else if (rows_per_cta == 8) {
+    LAUNCH_GROUPED_ROWS(8);
+  } else {
+    assert(rows_per_cta == 16);
+    LAUNCH_GROUPED_ROWS(16);
+  }
+#undef LAUNCH_GROUPED_ROWS
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void wkv_one_v2_cuda(

@@ -59,24 +59,28 @@ __device__ __forceinline__ float bf16_bits_to_float_dev(uint16_t bits) {
 }
 
 template <int Threads>
-__device__ __forceinline__ float block_sum_t(float x) {
-  __shared__ float partial[Threads / 32];
+__device__ __forceinline__ float block_sum_t(float x, int slot = 0) {
+  // A caller may start its next reduction as soon as it has read the returned
+  // shared scalar. Reusing one row here races that read under independent
+  // thread scheduling. Paired mean/variance reductions therefore use slots
+  // 0/1; this avoids an extra CTA barrier on the production LayerNorm path.
+  __shared__ float partial[2][Threads / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   x = warp_sum(x);
   if (lane == 0) {
-    partial[warp] = x;
+    partial[slot][warp] = x;
   }
   __syncthreads();
-  x = (threadIdx.x < (Threads / 32)) ? partial[lane] : 0.0f;
+  x = (threadIdx.x < (Threads / 32)) ? partial[slot][lane] : 0.0f;
   if (warp == 0) {
     x = warp_sum(x);
   }
   if (threadIdx.x == 0) {
-    partial[0] = x;
+    partial[slot][0] = x;
   }
   __syncthreads();
-  return partial[0];
+  return partial[slot][0];
 }
 
 __global__ void emb_ln0_bf16_to_f16_kernel(
@@ -98,13 +102,13 @@ __global__ void emb_ln0_bf16_to_f16_kernel(
   for (int c = tid; c < C; c += blockDim.x) {
     sum += bf16_bits_to_float_dev(er[c]);
   }
-  const float mean = block_sum_t<256>(sum) / static_cast<float>(C);
+  const float mean = block_sum_t<256>(sum, 0) / static_cast<float>(C);
   float var = 0.0f;
   for (int c = tid; c < C; c += blockDim.x) {
     const float d = bf16_bits_to_float_dev(er[c]) - mean;
     var += d * d;
   }
-  const float rstd = rsqrtf(block_sum_t<256>(var) / static_cast<float>(C) + eps);
+  const float rstd = rsqrtf(block_sum_t<256>(var, 1) / static_cast<float>(C) + eps);
   dtype* yr = out + static_cast<int64_t>(tok) * C;
   for (int c = tid; c < C; c += blockDim.x) {
     const float x = bf16_bits_to_float_dev(er[c]);
@@ -1394,7 +1398,7 @@ __global__ void layer_norm_f16_kernel(
     const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c));
     sum += v;
   }
-  sum = block_sum_t<LN_THREADS>(sum);
+  sum = block_sum_t<LN_THREADS>(sum, 0);
   const float inv_c = 1.0f / static_cast<float>(C);
   const float mean = sum * inv_c;
   float sum_var = 0.0f;
@@ -1403,7 +1407,7 @@ __global__ void layer_norm_f16_kernel(
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  sum_var = block_sum_t<LN_THREADS>(sum_var, 1);
   const float var = sum_var * inv_c;
   const float rstd = rsqrtf(var + eps);
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
@@ -1435,7 +1439,7 @@ __global__ void add_layer_norm_f16_kernel(
                     __half2float(*reinterpret_cast<const __half*>(residual + base + c));
     sum += v;
   }
-  sum = block_sum_t<LN_THREADS>(sum);
+  sum = block_sum_t<LN_THREADS>(sum, 0);
   const float inv_c = 1.0f / static_cast<float>(C);
   const float mean = sum * inv_c;
   float sum_var = 0.0f;
@@ -1445,7 +1449,7 @@ __global__ void add_layer_norm_f16_kernel(
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  sum_var = block_sum_t<LN_THREADS>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * inv_c + eps);
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
     const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
@@ -1454,6 +1458,168 @@ __global__ void add_layer_norm_f16_kernel(
     const float b = __half2float(*reinterpret_cast<const __half*>(bias + c));
     *reinterpret_cast<__half*>(x_out + base + c) = __float2half_rn(v);
     *reinterpret_cast<__half*>(y + base + c) = __float2half_rn((v - mean) * rstd * w + b);
+  }
+}
+
+template <int Threads, bool Vectorized>
+__global__ __launch_bounds__(Threads, 1) void layer_norm_f16_generic_cfg_kernel(
+    int C,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    dtype* __restrict__ y,
+    int64_t rows,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const float inv_c = 1.0f / static_cast<float>(C);
+  float sum = 0.0f;
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 v = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      sum += v.x + v.y;
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      sum += __half2float(*reinterpret_cast<const __half*>(x + base + c));
+    }
+  }
+  sum = block_sum_t<Threads>(sum, 0);
+  const float mean = sum * inv_c;
+
+  float sum_var = 0.0f;
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 v = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      const float d0 = v.x - mean;
+      const float d1 = v.y - mean;
+      sum_var += d0 * d0 + d1 * d1;
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c));
+      const float d = v - mean;
+      sum_var += d * d;
+    }
+  }
+  sum_var = block_sum_t<Threads>(sum_var, 1);
+  const float rstd = rsqrtf(sum_var * inv_c + eps);
+
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 v = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
+      const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
+      reinterpret_cast<__half2*>(y)[base2 + p] = __floats2half2_rn(
+          (v.x - mean) * rstd * w.x + b.x,
+          (v.y - mean) * rstd * w.y + b.y);
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c));
+      const float w = __half2float(*reinterpret_cast<const __half*>(weight + c));
+      const float b = __half2float(*reinterpret_cast<const __half*>(bias + c));
+      *reinterpret_cast<__half*>(y + base + c) = __float2half_rn((v - mean) * rstd * w + b);
+    }
+  }
+}
+
+template <int Threads, bool Vectorized>
+__global__ __launch_bounds__(Threads, 1) void add_layer_norm_f16_generic_cfg_kernel(
+    int C,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    dtype* __restrict__ x_out,
+    dtype* __restrict__ y,
+    int64_t rows,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const float inv_c = 1.0f / static_cast<float>(C);
+  float sum = 0.0f;
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
+      sum += xv.x + rv.x + xv.y + rv.y;
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+             __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    }
+  }
+  sum = block_sum_t<Threads>(sum, 0);
+  const float mean = sum * inv_c;
+
+  float sum_var = 0.0f;
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
+      const float v0 = xv.x + rv.x;
+      const float v1 = xv.y + rv.y;
+      const float d0 = v0 - mean;
+      const float d1 = v1 - mean;
+      sum_var += d0 * d0 + d1 * d1;
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                      __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+      const float d = v - mean;
+      sum_var += d * d;
+    }
+  }
+  sum_var = block_sum_t<Threads>(sum_var, 1);
+  const float rstd = rsqrtf(sum_var * inv_c + eps);
+
+  if constexpr (Vectorized) {
+    const int pairs = C >> 1;
+    const int64_t base2 = row * static_cast<int64_t>(pairs);
+    for (int p = threadIdx.x; p < pairs; p += Threads) {
+      const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+      const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
+      const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
+      const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
+      const float v0 = xv.x + rv.x;
+      const float v1 = xv.y + rv.y;
+      reinterpret_cast<__half2*>(x_out)[base2 + p] = __floats2half2_rn(v0, v1);
+      reinterpret_cast<__half2*>(y)[base2 + p] = __floats2half2_rn(
+          (v0 - mean) * rstd * w.x + b.x,
+          (v1 - mean) * rstd * w.y + b.y);
+    }
+  } else {
+    const int64_t base = row * static_cast<int64_t>(C);
+    for (int c = threadIdx.x; c < C; c += Threads) {
+      const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                      __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+      const float w = __half2float(*reinterpret_cast<const __half*>(weight + c));
+      const float b = __half2float(*reinterpret_cast<const __half*>(bias + c));
+      *reinterpret_cast<__half*>(x_out + base + c) = __float2half_rn(v);
+      *reinterpret_cast<__half*>(y + base + c) = __float2half_rn((v - mean) * rstd * w + b);
+    }
   }
 }
 
@@ -1486,7 +1652,7 @@ __global__ __launch_bounds__(Threads, 1) void layer_norm_f16_small_kernel(
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -1507,7 +1673,7 @@ __global__ __launch_bounds__(Threads, 1) void layer_norm_f16_small_kernel(
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -1565,7 +1731,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_f16_small_kernel(
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -1588,7 +1754,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_f16_small_kernel(
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -1775,7 +1941,7 @@ __global__ __launch_bounds__(256, 1) void add_layer_norm_f16_centered_cache_kern
         x, residual, x_out, base2 + threadIdx.x + static_cast<int64_t>(k) * Threads);
     sum += value.x + value.y;
   }
-  const float mean = block_sum_t<Threads>(sum) * (1.0f / static_cast<float>(LN_SMALL_C));
+  const float mean = block_sum_t<Threads>(sum, 0) * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
   for (int k = 0; k < PairsPerThread; ++k) {
@@ -1786,7 +1952,7 @@ __global__ __launch_bounds__(256, 1) void add_layer_norm_f16_centered_cache_kern
     sum_var += dx * dx + dy * dy;
   }
   const float rstd = rsqrtf(
-      block_sum_t<Threads>(sum_var) * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
+      block_sum_t<Threads>(sum_var, 1) * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < PairsPerThread; ++k) {
     const int64_t pair_index = base2 + threadIdx.x + static_cast<int64_t>(k) * Threads;
@@ -1896,7 +2062,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_kernel
     const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
     sum += xv.x + rv.x + xv.y + rv.y;
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1910,7 +2076,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_kernel
     const float d1 = x1 - mean;
     sum_var += d0 * d0 + d1 * d1;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -1958,7 +2124,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_scalar
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1969,7 +2135,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_scalar
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -2027,7 +2193,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_kerne
     const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
     sum += xv.x + rv.x + xv.y + rv.y;
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -2041,7 +2207,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_kerne
     const float d1 = x1 - mean;
     sum_var += d0 * d0 + d1 * d1;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -2110,7 +2276,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_scala
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -2121,7 +2287,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_scala
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -2202,7 +2368,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_small_kern
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -2225,7 +2391,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_small_kern
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -2288,7 +2454,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_generic_ke
     sum += __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + src + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2297,7 +2463,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_generic_ke
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   for (int p = threadIdx.x; p < pairs; p += Threads) {
@@ -2336,7 +2502,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_generi
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2345,7 +2511,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_generi
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   const int64_t base2 = base >> 1;
@@ -2400,7 +2566,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_gener
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2409,7 +2575,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_gener
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   const int64_t base2 = base >> 1;
@@ -2535,16 +2701,57 @@ void launch_layer_norm_f16_cfg(
   }
 }
 
+template <int Threads>
+void launch_layer_norm_f16_generic_cfg(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
+    at::Tensor& y,
+    int C,
+    int64_t rows,
+    float eps,
+    bool vectorized,
+    cudaStream_t stream) {
+  if (vectorized) {
+    layer_norm_f16_generic_cfg_kernel<Threads, true><<<static_cast<int>(rows), Threads, 0, stream>>>(
+        C, x.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
+        y.data_ptr<dtype>(), rows, eps);
+  } else {
+    layer_norm_f16_generic_cfg_kernel<Threads, false><<<static_cast<int>(rows), Threads, 0, stream>>>(
+        C, x.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
+        y.data_ptr<dtype>(), rows, eps);
+  }
+}
+
 at::Tensor layer_norm_f16_cfg_cuda(
     at::Tensor x,
     at::Tensor weight,
     at::Tensor bias,
     double eps,
-    int threads,
-    bool vectorized) {
+  int threads,
+  bool vectorized) {
   auto y = at::empty_like(x);
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int C = static_cast<int>(x.size(-1));
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (C != LN_SMALL_C) {
+    switch (threads) {
+      case 128:
+        launch_layer_norm_f16_generic_cfg<128>(x, weight, bias, y, C, rows, static_cast<float>(eps), vectorized, stream);
+        break;
+      case 256:
+        launch_layer_norm_f16_generic_cfg<256>(x, weight, bias, y, C, rows, static_cast<float>(eps), vectorized, stream);
+        break;
+      case 512:
+        launch_layer_norm_f16_generic_cfg<512>(x, weight, bias, y, C, rows, static_cast<float>(eps), vectorized, stream);
+        break;
+      default:
+        launch_layer_norm_f16_generic_cfg<1024>(x, weight, bias, y, C, rows, static_cast<float>(eps), vectorized, stream);
+        break;
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+  }
   switch (threads) {
     case 128:
       launch_layer_norm_f16_cfg<128>(x, weight, bias, y, rows, static_cast<float>(eps), vectorized, stream);
@@ -2674,6 +2881,52 @@ void launch_add_layer_norm_f16_cfg(
   }
 }
 
+template <int Threads>
+void launch_add_layer_norm_f16_generic_cfg(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
+    at::Tensor& x_out,
+    at::Tensor& y,
+    int C,
+    int64_t rows,
+    float eps,
+    bool vectorized,
+    cudaStream_t stream) {
+  if (vectorized) {
+    add_layer_norm_f16_generic_cfg_kernel<Threads, true><<<static_cast<int>(rows), Threads, 0, stream>>>(
+        C, x.data_ptr<dtype>(), residual.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows, eps);
+  } else {
+    add_layer_norm_f16_generic_cfg_kernel<Threads, false><<<static_cast<int>(rows), Threads, 0, stream>>>(
+        C, x.data_ptr<dtype>(), residual.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows, eps);
+  }
+}
+
+template <int Threads>
+void dispatch_add_layer_norm_f16_cfg(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
+    at::Tensor& x_out,
+    at::Tensor& y,
+    int C,
+    int64_t rows,
+    float eps,
+    bool vectorized,
+    cudaStream_t stream) {
+  if (C == LN_SMALL_C) {
+    launch_add_layer_norm_f16_cfg<Threads>(
+        x, residual, weight, bias, x_out, y, rows, eps, vectorized, stream);
+  } else {
+    launch_add_layer_norm_f16_generic_cfg<Threads>(
+        x, residual, weight, bias, x_out, y, C, rows, eps, vectorized, stream);
+  }
+}
+
 std::vector<at::Tensor> add_layer_norm_f16_cfg_cuda(
     at::Tensor x,
     at::Tensor residual,
@@ -2681,27 +2934,28 @@ std::vector<at::Tensor> add_layer_norm_f16_cfg_cuda(
     at::Tensor bias,
     double eps,
     int threads,
-    bool vectorized) {
+  bool vectorized) {
   auto x_out = at::empty_like(x);
   auto y = at::empty_like(x);
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int C = static_cast<int>(x.size(-1));
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (threads) {
     case 128:
-      launch_add_layer_norm_f16_cfg<128>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<128>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     case 256:
-      launch_add_layer_norm_f16_cfg<256>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<256>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     case 512:
-      launch_add_layer_norm_f16_cfg<512>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<512>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     default:
-      launch_add_layer_norm_f16_cfg<1024>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<1024>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2718,24 +2972,25 @@ void add_layer_norm_f16_cfg_out_cuda(
     double eps,
     int threads,
     bool vectorized) {
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int C = static_cast<int>(x.size(-1));
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (threads) {
     case 128:
-      launch_add_layer_norm_f16_cfg<128>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<128>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     case 256:
-      launch_add_layer_norm_f16_cfg<256>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<256>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     case 512:
-      launch_add_layer_norm_f16_cfg<512>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<512>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
     default:
-      launch_add_layer_norm_f16_cfg<1024>(
-          x, residual, weight, bias, x_out, y, rows, static_cast<float>(eps), vectorized, stream);
+      dispatch_add_layer_norm_f16_cfg<1024>(
+          x, residual, weight, bias, x_out, y, C, rows, static_cast<float>(eps), vectorized, stream);
       break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();

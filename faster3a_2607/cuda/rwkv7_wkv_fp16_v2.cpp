@@ -162,6 +162,23 @@ void wkv_one_w0_v2_cuda(
     torch::Tensor y,
     torch::Tensor elapsed_t);
 
+void wkv_grouped_w0_forced_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    int rows_per_cta,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
 void wkv_seq(
     int64_t B,
     int64_t T,
@@ -528,6 +545,32 @@ void wkv_seq_w0_forced(
       elapsed_t);
 }
 
+void wkv_grouped_w0_forced(
+    int64_t B,
+    int64_t T,
+    int64_t C,
+    int64_t H,
+    int64_t rows_per_cta,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  TORCH_CHECK(T > 1, "wkv_grouped_w0_forced is a T>1 tuning-only entry");
+  TORCH_CHECK(rows_per_cta == 4 || rows_per_cta == 8 || rows_per_cta == 16,
+              "rows_per_cta must be 4, 8, or 16");
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_grouped_w0_forced_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C), static_cast<int>(H),
+      static_cast<int>(rows_per_cta), state, r, w, w0, k, v, a, b, y, elapsed_t);
+}
+
 TORCH_LIBRARY(rwkv7_wkv_fp16_v2, m) {
   m.def("wkv_seq", wkv_seq);
   m.def("wkv_seq_w0", wkv_seq_w0);
@@ -541,4 +584,5 @@ TORCH_LIBRARY(rwkv7_wkv_fp16_v2, m) {
   m.def("wkv_seq_w0_forced", wkv_seq_w0_forced);
   m.def("wkv_seq_grid2d_forced", wkv_seq_grid2d_forced);
   m.def("wkv_seq_w0_grid2d_forced", wkv_seq_w0_grid2d_forced);
+  m.def("wkv_grouped_w0_forced", wkv_grouped_w0_forced);
 }
