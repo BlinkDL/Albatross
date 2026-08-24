@@ -1,6 +1,6 @@
 # Albatross : efficient RWKV inference engine
 
-UPDATE: faster3a_2607 and faster3a_2605 are much faster now, with DeltaLog (use --deltalog) and new [K,V] state layout.
+UPDATE: faster3a_2607 and faster3a_2605 are up to 47% faster now, with DeltaLog (use --deltalog) and new [K,V] state layout.
 
 UPDATE: faster3a_2607 is faster than faster3a_2605 (only tuned for 7B).
 ```
