@@ -17,6 +17,7 @@ THIS_DIR = Path(__file__).resolve().parent
 CUDA_DIR = THIS_DIR / "cuda"
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
+WKV_STATE_LAYOUT = "kv_v2"
 EMB_DEVICE = "cpu"
 RKV_MODE = "off"
 CMIX_SPARSE = "no-fc"
@@ -35,6 +36,34 @@ CMIX_ROWS2_SPARSE = "rows2_sparse"
 CMIX_B1T1_NOFC = "b1t1_nofc"
 CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
+
+def convert_wkv_state_layout(
+    state: list,
+    source_layout: str,
+    target_layout: str = WKV_STATE_LAYOUT,
+) -> list:
+    """Return a state list whose WKV matrices use the requested physical ABI."""
+    layouts = {"vk_v1", "kv_v2"}
+    if source_layout not in layouts or target_layout not in layouts:
+        raise ValueError(f"unsupported WKV state layout: {source_layout} -> {target_layout}")
+    if source_layout == target_layout:
+        return state
+    if len(state) != 3:
+        raise ValueError("RWKV state must contain shift, WKV, and elapsed entries")
+
+    def transpose_wkv(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim < 2 or tensor.shape[-2:] != (HEAD_SIZE, HEAD_SIZE):
+            raise ValueError("WKV state matrices must end in [64,64]")
+        return tensor.transpose(-1, -2).contiguous()
+
+    converted = list(state)
+    wkv = state[1]
+    converted[1] = (
+        [transpose_wkv(layer_state) for layer_state in wkv]
+        if isinstance(wkv, list)
+        else transpose_wkv(wkv)
+    )
+    return converted
 
 def main() -> None:
     global MODEL_PATH, WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS, PP_DEVICES
@@ -67,7 +96,7 @@ def main() -> None:
     PP_DEVICES = parse_pp_devices(args.pp_devices)
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups} pp={pp}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_state_layout={WKV_STATE_LAYOUT} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -237,6 +266,7 @@ class RWKV7:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
         torch._C._jit_set_autocast_mode(False)
+        self.wkv_state_layout = WKV_STATE_LAYOUT
 
         t0 = time.perf_counter()
         log(f"loading weights from {MODEL_PATH}")
@@ -314,6 +344,7 @@ class RWKV7:
         log(cuda_mem())
 
     def zero_state(self, B: int) -> list[torch.Tensor]:
+        # A zero matrix is layout-invariant; every WKV kernel writes it as kv_v2.
         if pp_enabled():
             shift = []
             wkv = []

@@ -14,6 +14,10 @@ namespace {
 constexpr int N = 64;
 constexpr int HALF2_N = N / 2;
 constexpr int LDG_ELEMS = sizeof(int4) / sizeof(half);
+
+#ifndef RWKV_FP16_KV_STREAM_T1_STATE
+#define RWKV_FP16_KV_STREAM_T1_STATE 1
+#endif
 constexpr float TWO_NEG_41 = 4.547473508864641e-13f;
 constexpr float NEXP_HALF_LOG2_E = -0.8750387749145276f;
 constexpr float NLOG2_E = -1.4426950408889634f;
@@ -38,6 +42,22 @@ __device__ __forceinline__ half w_delta_maybe_w0(half w_raw, const half* __restr
     w += __half2float(w0_ptr[c]);
   }
   return w_delta(w, phase);
+}
+
+// Candidate ABI: state is physically [K,V].  A thread still owns one V row
+// for the recurrent arithmetic, so each half2 register combines two K rows.
+// The two scalar instructions are warp-coalesced across adjacent V lanes.
+__device__ __forceinline__ half2 load_state_kv(
+    const half* __restrict__ state_base, int v, int k2) {
+  return __halves2half2(
+      __ldg(state_base + (2 * k2) * N + v),
+      __ldg(state_base + (2 * k2 + 1) * N + v));
+}
+
+__device__ __forceinline__ void store_state_kv(
+    half* __restrict__ state_base, int v, int k2, half2 value) {
+  state_base[(2 * k2) * N + v] = value.x;
+  state_base[(2 * k2 + 1) * N + v] = value.y;
 }
 
 template <int Bytes>
@@ -65,7 +85,19 @@ __device__ __forceinline__ void clone_cp_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
 }
 
-template <bool Tis1 = false, bool AddW0 = false>
+template <bool Grid2D>
+__device__ __forceinline__ void decode_batch_head(int H, int& batch, int& head) {
+  if constexpr (Grid2D) {
+    head = static_cast<int>(blockIdx.x);
+    batch = static_cast<int>(blockIdx.y);
+  } else {
+    const int bh = static_cast<int>(blockIdx.x);
+    batch = bh / H;
+    head = bh - batch * H;
+  }
+}
+
+template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
 __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
     const int B,
     const int T,
@@ -84,31 +116,17 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
   if constexpr (Tis1) {
     __builtin_assume(T == 1);
   }
-  const int b = blockIdx.x / H;
-  const int h = blockIdx.x % H;
+  int b;
+  int h;
+  decode_batch_head<Grid2D>(H, b, h);
   const int i = threadIdx.x;
   const int lane = i % 32;
 
-  __shared__ __align__(256) half2 state_smem[CLONE_N][CLONE_N / 2];
-
   state_ptr += b * C * CLONE_N + h * CLONE_N * CLONE_N;
-  constexpr int ldg_size = sizeof(int4) / sizeof(F);
-#pragma unroll
-  for (int j0 = 0; j0 < CLONE_N / ldg_size; j0++) {
-    int4 state_vec = ((int4*)state_ptr)[j0 * CLONE_N + i];
-#pragma unroll
-    for (int j1 = 0; j1 < ldg_size / 2; j1++) {
-      int row = j0 * ldg_size + i * ldg_size / CLONE_N;
-      int col = i * ldg_size % CLONE_N / 2 + j1;
-      state_smem[row][(row % 32) ^ col] = ((half2*)&state_vec)[j1];
-    }
-  }
-  __syncthreads();
-
   half2 state[CLONE_N / 2];
 #pragma unroll
   for (int j = 0; j < CLONE_N / 2; j++) {
-    state[j] = state_smem[i][lane ^ j];
+    state[j] = load_state_kv(state_ptr, i, j);
   }
 
   __shared__ __align__(128) half2 r[CLONE_N / 2], k[CLONE_N / 2], w[CLONE_N / 2], a[CLONE_N / 2], bvec[CLONE_N / 2], bvec_dummy[CLONE_N / 2];
@@ -119,7 +137,8 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
     clone_cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + t) + lane, true);
     clone_cp_commit();
     clone_cp_async<4>((half2*)(i < 32 ? r : k) + lane, (half2*)((i < 32 ? r_ptr : k_ptr) + t) + lane, true);
-    // src-size 0 zero-fills, so warp 1 must not race warp 0's real bvec copy.
+    // src-size 0 zero-fills, so warp 1 must target dummy shared instead of
+    // racing warp 0's real bvec copy. Keep this branchless for WKV occupancy.
     clone_cp_async<4>((i < 32 ? bvec : bvec_dummy) + lane, (half2*)(b_ptr + t) + lane, i < 32);
     clone_cp_commit();
 
@@ -150,19 +169,7 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
 
 #pragma unroll
   for (int j = 0; j < CLONE_N / 2; j++) {
-    state_smem[i][lane ^ j] = state[j];
-  }
-  __syncthreads();
-#pragma unroll
-  for (int j0 = 0; j0 < CLONE_N / ldg_size; j0++) {
-    int4 state_vec;
-#pragma unroll
-    for (int j1 = 0; j1 < ldg_size / 2; j1++) {
-      int row = j0 * ldg_size + i * ldg_size / CLONE_N;
-      int col = i * ldg_size % CLONE_N / 2 + j1;
-      ((half2*)&state_vec)[j1] = state_smem[row][(row % 32) ^ col];
-    }
-    ((int4*)state_ptr)[j0 * CLONE_N + i] = state_vec;
+    store_state_kv(state_ptr, i, j, state[j]);
   }
 }
 
@@ -209,12 +216,13 @@ __device__ __forceinline__ void prefetch_token(
   cp_async<4>((tid < 32 ? w : a) + lane, (const half2*)(tid < 32 ? w_ptr + token : a_ptr + token) + lane, true);
   cp_commit();
   cp_async<4>((tid < 32 ? r : k) + lane, (const half2*)(tid < 32 ? r_ptr + token : k_ptr + token) + lane, true);
-  // A predicated-off cp.async still zero-fills its shared destination.
+  // A predicated-off cp.async zero-fills its destination. Warp 1 therefore
+  // needs a disjoint target; pointing both warps at b would be a shared race.
   cp_async<4>((tid < 32 ? b : b_dummy) + lane, (const half2*)(b_ptr + token) + lane, tid < 32);
   cp_commit();
 }
 
-template <bool Tis1 = false, bool AddW0 = false>
+template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
     const int B,
     const int T,
@@ -233,30 +241,18 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
   if constexpr (Tis1) {
     __builtin_assume(T == 1);
   }
-  const int b_id = blockIdx.x / H;
-  const int h = blockIdx.x % H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i % 32;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   state_ptr += b_id * C * N + h * N * N;
-
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; j0++) {
-    int4 state_vec = ((int4*)state_ptr)[j0 * N + i];
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; j1++) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row % 32) ^ col] = ((half2*)&state_vec)[j1];
-    }
-  }
-  __syncthreads();
 
   half2 state[HALF2_N];
 #pragma unroll
   for (int j = 0; j < HALF2_N; j++) {
-    state[j] = state_smem[i][lane ^ j];
+    state[j] = load_state_kv(state_ptr, i, j);
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], k[HALF2_N], w[HALF2_N], a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
@@ -267,6 +263,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
     cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + t) + lane, true);
     cp_commit();
     cp_async<4>((half2*)(i < 32 ? r : k) + lane, (half2*)((i < 32 ? r_ptr : k_ptr) + t) + lane, true);
+    // Do not merge bvec_dummy into bvec: warp 1's src-size 0 copy writes zeros.
     cp_async<4>((i < 32 ? bvec : bvec_dummy) + lane, (half2*)(b_ptr + t) + lane, i < 32);
     cp_commit();
 
@@ -297,23 +294,11 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
 
 #pragma unroll
   for (int j = 0; j < HALF2_N; j++) {
-    state_smem[i][lane ^ j] = state[j];
-  }
-  __syncthreads();
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; j0++) {
-    int4 state_vec;
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; j1++) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      ((half2*)&state_vec)[j1] = state_smem[row][(row % 32) ^ col];
-    }
-    ((int4*)state_ptr)[j0 * N + i] = state_vec;
+    store_state_kv(state_ptr, i, j, state[j]);
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
     int T,
     int C,
@@ -328,31 +313,18 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
     const half* __restrict__ b_ptr,
     half* __restrict__ y_ptr,
     const int* __restrict__ elapsed_t) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i & 31;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   state_ptr += static_cast<int64_t>(b_id) * C * N + h * N * N;
-
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec = ((int4*)state_ptr)[j0 * N + i];
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row & 31) ^ col] = ((half2*)&state_vec)[j1];
-    }
-  }
-  __syncthreads();
 
   half2 state[HALF2_N];
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state[j] = state_smem[i][lane ^ j];
+    state[j] = load_state_kv(state_ptr, i, j);
   }
 
   __shared__ __align__(128) half2 r[2][HALF2_N], w[2][HALF2_N], k[2][HALF2_N], a[2][HALF2_N], bvec[2][HALF2_N], bvec_dummy[HALF2_N];
@@ -395,23 +367,11 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
 
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state_smem[i][lane ^ j] = state[j];
-  }
-  __syncthreads();
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec;
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      ((half2*)&state_vec)[j1] = state_smem[row][(row & 31) ^ col];
-    }
-    ((int4*)state_ptr)[j0 * N + i] = state_vec;
+    store_state_kv(state_ptr, i, j, state[j]);
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
     int C,
     int H,
@@ -425,31 +385,17 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
     const half* __restrict__ b_ptr,
     half* __restrict__ y_ptr,
     const int* __restrict__ elapsed_t) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
-  const int lane = i & 31;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   half* state_base = state_ptr + static_cast<int64_t>(b_id) * C * N + h * N * N;
-
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec = ((int4*)state_base)[j0 * N + i];
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row & 31) ^ col] = ((half2*)&state_vec)[j1];
-    }
-  }
-  __syncthreads();
 
   half2 state[HALF2_N];
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state[j] = state_smem[i][lane ^ j];
+    state[j] = load_state_kv(state_base, i, j);
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], w[HALF2_N], k[HALF2_N], a[HALF2_N], bvec[HALF2_N];
@@ -488,23 +434,11 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
 
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state_smem[i][lane ^ j] = state[j];
-  }
-  __syncthreads();
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec;
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      ((half2*)&state_vec)[j1] = state_smem[row][(row & 31) ^ col];
-    }
-    ((int4*)state_base)[j0 * N + i] = state_vec;
+    store_state_kv(state_base, i, j, state[j]);
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
     int C,
     int H,
@@ -518,31 +452,18 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
     const half* __restrict__ b_ptr,
     half* __restrict__ y_ptr,
     const int* __restrict__ elapsed_t) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i & 31;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   half* state_base = state_ptr + static_cast<int64_t>(b_id) * C * N + h * N * N;
-
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec = ((int4*)state_base)[j0 * N + i];
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row & 31) ^ col] = ((half2*)&state_vec)[j1];
-    }
-  }
-  __syncthreads();
 
   half2 state[HALF2_N];
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state[j] = state_smem[i][lane ^ j];
+    state[j] = load_state_kv(state_base, i, j);
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], w[HALF2_N], k[HALF2_N], a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
@@ -550,7 +471,7 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
   cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + token) + lane, true);
   cp_commit();
   cp_async<4>((half2*)(i < 32 ? r : k) + lane, (half2*)((i < 32 ? r_ptr : k_ptr) + token) + lane, true);
-  // bvec_dummy is correctness-critical: warp 1's src-size 0 copy writes zeros.
+  // The dummy allocation is correctness-critical, not padding; see exact/seq.
   cp_async<4>((i < 32 ? bvec : bvec_dummy) + lane, (half2*)(b_ptr + token) + lane, i < 32);
   cp_commit();
 
@@ -581,19 +502,268 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
 
 #pragma unroll
   for (int j = 0; j < HALF2_N; ++j) {
-    state_smem[i][lane ^ j] = state[j];
+    store_state_kv(state_base, i, j, state[j]);
+  }
+}
+
+template <bool AddW0 = false, bool Grid2D = false, bool StreamState = false>
+__global__ __launch_bounds__(32, 8) void wkv_fp16_kv_warp_pair_kernel(
+    int T,
+    int C,
+    int H,
+    half* __restrict__ state_ptr,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ w_ptr,
+    const half* __restrict__ w0_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ y_ptr,
+    const int* __restrict__ elapsed_t) {
+  int batch;
+  int head;
+  decode_batch_head<Grid2D>(H, batch, head);
+  const int lane = threadIdx.x;
+  half* const state_base =
+      state_ptr + (static_cast<int64_t>(batch) * H + head) * N * N;
+
+  // Each lane owns two adjacent V columns.  One half2 load per K row gives a
+  // full 128-byte coalesced warp request, halving state requests versus the
+  // two-warp scalar KV compatibility path.
+  half2 state[N];
+#pragma unroll
+  for (int key = 0; key < N; ++key) {
+    const half2* const state_row =
+        reinterpret_cast<const half2*>(state_base + key * N) + lane;
+#if RWKV_FP16_KV_STREAM_T1_STATE
+    // T1 reads each state line once.  Evict-first avoids retaining this large
+    // stream over the weights consumed by the following full-model kernels.
+    if constexpr (StreamState) {
+      state[key] = __ldcs(state_row);
+    } else {
+      state[key] = __ldg(state_row);
+    }
+#else
+    state[key] = __ldg(state_row);
+#endif
+  }
+
+  __shared__ __align__(128) half2 r[HALF2_N];
+  __shared__ __align__(128) half2 w[HALF2_N];
+  __shared__ __align__(128) half2 k[HALF2_N];
+  __shared__ __align__(128) half2 a[HALF2_N];
+  __shared__ __align__(128) half2 bvec[HALF2_N];
+
+  for (int tt = 0; tt < T; ++tt) {
+    const int64_t token =
+        (static_cast<int64_t>(batch) * T + tt) * C + head * N;
+    const int64_t idx2 = (token >> 1) + lane;
+    r[lane] = __ldg(reinterpret_cast<const half2*>(r_ptr) + idx2);
+    k[lane] = __ldg(reinterpret_cast<const half2*>(k_ptr) + idx2);
+    a[lane] = __ldg(reinterpret_cast<const half2*>(a_ptr) + idx2);
+    bvec[lane] = __ldg(reinterpret_cast<const half2*>(b_ptr) + idx2);
+    const half2 raw_w = __ldg(reinterpret_cast<const half2*>(w_ptr) + idx2);
+    const int phase = elapsed_t[batch] + head * N + 2 * lane + tt;
+    w[lane] = __halves2half2(
+        w_delta_maybe_w0<AddW0>(raw_w.x, w0_ptr, head * N + 2 * lane, phase),
+        w_delta_maybe_w0<AddW0>(raw_w.y, w0_ptr, head * N + 2 * lane + 1, phase + 1));
+    __syncwarp();
+
+    half2 sa_even = __float2half2_rn(0.0f);
+    half2 sa_odd = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key2 = 0; key2 < HALF2_N; ++key2) {
+      const half2 av = a[key2];
+      sa_even = __hfma2(state[2 * key2], __halves2half2(av.x, av.x), sa_even);
+      sa_odd = __hfma2(state[2 * key2 + 1], __halves2half2(av.y, av.y), sa_odd);
+    }
+    const half2 sa = __hadd2(sa_even, sa_odd);
+    const half2 vv = __ldg(reinterpret_cast<const half2*>(v_ptr) + idx2);
+    half2 y_even = __float2half2_rn(0.0f);
+    half2 y_odd = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key2 = 0; key2 < HALF2_N; ++key2) {
+      const half2 rv = r[key2];
+      const half2 wv = w[key2];
+      const half2 kv = k[key2];
+      const half2 bv = bvec[key2];
+      half2& even = state[2 * key2];
+      half2& odd = state[2 * key2 + 1];
+      even = __hfma2(
+          even, __halves2half2(wv.x, wv.x),
+          __hfma2(__halves2half2(kv.x, kv.x), vv,
+                  __hfma2(sa, __halves2half2(bv.x, bv.x), even)));
+      odd = __hfma2(
+          odd, __halves2half2(wv.y, wv.y),
+          __hfma2(__halves2half2(kv.y, kv.y), vv,
+                  __hfma2(sa, __halves2half2(bv.y, bv.y), odd)));
+      y_even = __hfma2(even, __halves2half2(rv.x, rv.x), y_even);
+      y_odd = __hfma2(odd, __halves2half2(rv.y, rv.y), y_odd);
+    }
+    reinterpret_cast<half2*>(y_ptr)[idx2] = __hadd2(y_even, y_odd);
+    // All lanes consume the shared token before the next iteration overwrites
+    // it.  Keep this consumer barrier if the loop is later software-pipelined.
+    __syncwarp();
+  }
+
+#pragma unroll
+  for (int key = 0; key < N; ++key) {
+    half2* const state_row =
+        reinterpret_cast<half2*>(state_base + key * N) + lane;
+#if RWKV_FP16_KV_STREAM_T1_STATE
+    if constexpr (StreamState) {
+      __stcs(state_row, state[key]);
+    } else {
+      *state_row = state[key];
+    }
+#else
+    *state_row = state[key];
+#endif
+  }
+}
+
+template <bool AddW0 = false, bool Grid2D = false, bool StreamState = false>
+__global__ __launch_bounds__(N, 2) void wkv_fp16_kv_vector_kernel(
+    int T,
+    int C,
+    int H,
+    half* __restrict__ state_ptr,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ w_ptr,
+    const half* __restrict__ w0_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ y_ptr,
+    const int* __restrict__ elapsed_t) {
+  int batch;
+  int head;
+  decode_batch_head<Grid2D>(H, batch, head);
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  half* const state_base =
+      state_ptr + (static_cast<int64_t>(batch) * H + head) * N * N;
+  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
+
+  // Pair adjacent K rows before transposing. This mapping is performance- and
+  // correctness-critical: handling one K row at a time doubles the shared
+  // instruction count because each destination register is a K-pair half2.
+#pragma unroll
+  for (int pair_segment = tid; pair_segment < HALF2_N * (N / LDG_ELEMS);
+       pair_segment += N) {
+    const int key2 = pair_segment >> 3;
+    const int segment = pair_segment & 7;
+    const int4* const lo_ptr = reinterpret_cast<const int4*>(
+        state_base + (2 * key2) * N) + segment;
+    const int4* const hi_ptr = reinterpret_cast<const int4*>(
+        state_base + (2 * key2 + 1) * N) + segment;
+#if RWKV_FP16_KV_STREAM_T1_STATE
+    const int4 lo = StreamState ? __ldcs(lo_ptr) : __ldg(lo_ptr);
+    const int4 hi = StreamState ? __ldcs(hi_ptr) : __ldg(hi_ptr);
+#else
+    const int4 lo = __ldg(lo_ptr);
+    const int4 hi = __ldg(hi_ptr);
+#endif
+    const int value0 = segment * LDG_ELEMS;
+#pragma unroll
+    for (int q = 0; q < LDG_ELEMS; ++q) {
+      const int value = value0 + q;
+      state_smem[value][(value & 31) ^ key2] = __halves2half2(
+          reinterpret_cast<const half*>(&lo)[q],
+          reinterpret_cast<const half*>(&hi)[q]);
+    }
+  }
+  __syncthreads();
+
+  half2 state[HALF2_N];
+#pragma unroll
+  for (int key2 = 0; key2 < HALF2_N; ++key2) {
+    state[key2] = state_smem[tid][lane ^ key2];
+  }
+
+  __shared__ __align__(128) half2 r[HALF2_N], w[HALF2_N], k[HALF2_N];
+  __shared__ __align__(128) half2 a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
+  for (int tt = 0; tt < T; ++tt) {
+    const int64_t token =
+        (static_cast<int64_t>(batch) * T + tt) * C + head * N;
+    __syncthreads();
+    cp_async<4>((tid < 32 ? w : a) + lane,
+                reinterpret_cast<const half2*>(tid < 32 ? w_ptr + token : a_ptr + token) + lane,
+                true);
+    cp_commit();
+    cp_async<4>((tid < 32 ? r : k) + lane,
+                reinterpret_cast<const half2*>(tid < 32 ? r_ptr + token : k_ptr + token) + lane,
+                true);
+    cp_async<4>((tid < 32 ? bvec : bvec_dummy) + lane,
+                reinterpret_cast<const half2*>(b_ptr + token) + lane, tid < 32);
+    cp_commit();
+
+    const half vv = __ldg(v_ptr + token + tid);
+    const half2 vv2 = __halves2half2(vv, vv);
+    half2 sa2 = __float2half2_rn(0.0f);
+    cp_wait<1>();
+    __syncthreads();
+#pragma unroll
+    for (int key2 = 0; key2 < HALF2_N; ++key2) {
+      sa2 = __hfma2(a[key2], state[key2], sa2);
+    }
+    const half sa = sa2.x + sa2.y;
+    sa2 = __halves2half2(sa, sa);
+    reinterpret_cast<half*>(w)[tid] = w_delta_maybe_w0<AddW0>(
+        reinterpret_cast<half*>(w)[tid], w0_ptr, head * N + tid,
+        elapsed_t[batch] + head * N + tid + tt);
+    cp_wait<0>();
+    __syncthreads();
+
+    half2 y2 = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key2 = 0; key2 < HALF2_N; ++key2) {
+      half2& s = state[key2];
+      s = __hfma2(s, w[key2],
+                  __hfma2(k[key2], vv2, __hfma2(sa2, bvec[key2], s)));
+      y2 = __hfma2(s, r[key2], y2);
+    }
+    y_ptr[token + tid] = y2.x + y2.y;
+  }
+
+#pragma unroll
+  for (int key2 = 0; key2 < HALF2_N; ++key2) {
+    state_smem[tid][lane ^ key2] = state[key2];
   }
   __syncthreads();
 #pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec;
+  for (int pair_segment = tid; pair_segment < HALF2_N * (N / LDG_ELEMS);
+       pair_segment += N) {
+    int4 lo;
+    int4 hi;
+    const int key2 = pair_segment >> 3;
+    const int segment = pair_segment & 7;
+    const int value0 = segment * LDG_ELEMS;
 #pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      int row = j0 * LDG_ELEMS + i * LDG_ELEMS / N;
-      int col = i * LDG_ELEMS % N / 2 + j1;
-      ((half2*)&state_vec)[j1] = state_smem[row][(row & 31) ^ col];
+    for (int q = 0; q < LDG_ELEMS; ++q) {
+      const int value = value0 + q;
+      const half2 packed = state_smem[value][(value & 31) ^ key2];
+      reinterpret_cast<half*>(&lo)[q] = packed.x;
+      reinterpret_cast<half*>(&hi)[q] = packed.y;
     }
-    ((int4*)state_base)[j0 * N + i] = state_vec;
+    int4* const lo_ptr = reinterpret_cast<int4*>(
+        state_base + (2 * key2) * N) + segment;
+    int4* const hi_ptr = reinterpret_cast<int4*>(
+        state_base + (2 * key2 + 1) * N) + segment;
+#if RWKV_FP16_KV_STREAM_T1_STATE
+    if constexpr (StreamState) {
+      __stcs(lo_ptr, lo);
+      __stcs(hi_ptr, hi);
+    } else {
+      *lo_ptr = lo;
+      *hi_ptr = hi;
+    }
+#else
+    *lo_ptr = lo;
+    *hi_ptr = hi;
+#endif
   }
 }
 
@@ -603,6 +773,28 @@ bool use_v2_seq(int B, int T) {
          (B == 8 && T >= 8) ||
          (B == 64 && T == 1) ||
          (B == 128 && T == 1);
+}
+
+bool use_kv_vector_auto(int B, int T, int H) {
+  // The int4/shared transpose only amortizes at T1 once the state stream is at
+  // least about 160 MiB.  All H32/H40/H64 points above this boundary were
+  // positive on GPU1/2/3 in the two-address gate; do not reuse this rule for
+  // T>1, where recurrent work amortizes the direct KV load/store instead.
+  return T == 1 && static_cast<int64_t>(B) * H >= 20000;
+}
+
+bool use_kv_warp_auto(int B, int T, int H) {
+  if (T == 1) {
+    // The shared-address multimode gate showed that H16/B960, H32/B512,
+    // H40/B384, and H64/B256 all cross over in the same B*H band.  The vector
+    // branch above owns B*H >= 20000; one-warp owns the narrower 15000..19999
+    // interval without binding dispatch to a particular model width.
+    return static_cast<int64_t>(B) * H >= 15000;
+  }
+  // With enough independent (batch,head) CTAs, the one-warp kernel retains
+  // occupancy while halving state memory requests.  Every measured point in
+  // this region (T2..T32, H12..H64) was positive on all three GPUs.
+  return static_cast<int64_t>(B) * H >= 1280;
 }
 
 }  // namespace
@@ -623,7 +815,7 @@ void wkv_one_v2_cuda_impl(
     at::Tensor y,
     at::Tensor elapsed_t);
 
-void wkv_seq_v2_cuda_impl(
+void launch_wkv_seq_v2_cuda_impl(
     int B,
     int T,
     int C,
@@ -640,14 +832,93 @@ void wkv_seq_v2_cuda_impl(
     at::Tensor y,
     at::Tensor elapsed_t) {
   assert(C == H * N);
-  if (T == 1) {
-    wkv_one_v2_cuda_impl(B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (use_kv_vector_auto(B, T, H)) {
+    if (add_w0) {
+      wkv_fp16_kv_vector_kernel<true, false, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+          T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+    } else {
+      wkv_fp16_kv_vector_kernel<false, false, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+          T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(w.data_ptr()), nullptr,
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
-  if (use_v2_seq(B, T)) {
+  if (use_kv_warp_auto(B, T, H)) {
+    // This branch uses the measured 2D mapping; the other production paths
+    // retain the historical flat batch-head grid.
     if (add_w0) {
-      wkv_fp16_seq_v2_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      if (T == 1) {
+        wkv_fp16_kv_warp_pair_kernel<true, true, true><<<dim3(H, B), dim3(32), 0, stream>>>(
+            T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+            reinterpret_cast<const half*>(r.data_ptr()),
+            reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
+            reinterpret_cast<const half*>(k.data_ptr()),
+            reinterpret_cast<const half*>(v.data_ptr()),
+            reinterpret_cast<const half*>(a.data_ptr()),
+            reinterpret_cast<const half*>(b.data_ptr()),
+            reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+      } else {
+        wkv_fp16_kv_warp_pair_kernel<true, true, false><<<dim3(H, B), dim3(32), 0, stream>>>(
+            T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+            reinterpret_cast<const half*>(r.data_ptr()),
+            reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
+            reinterpret_cast<const half*>(k.data_ptr()),
+            reinterpret_cast<const half*>(v.data_ptr()),
+            reinterpret_cast<const half*>(a.data_ptr()),
+            reinterpret_cast<const half*>(b.data_ptr()),
+            reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+      }
+    } else {
+      if (T == 1) {
+        wkv_fp16_kv_warp_pair_kernel<false, true, true><<<dim3(H, B), dim3(32), 0, stream>>>(
+            T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+            reinterpret_cast<const half*>(r.data_ptr()),
+            reinterpret_cast<const half*>(w.data_ptr()), nullptr,
+            reinterpret_cast<const half*>(k.data_ptr()),
+            reinterpret_cast<const half*>(v.data_ptr()),
+            reinterpret_cast<const half*>(a.data_ptr()),
+            reinterpret_cast<const half*>(b.data_ptr()),
+            reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+      } else {
+        wkv_fp16_kv_warp_pair_kernel<false, true, false><<<dim3(H, B), dim3(32), 0, stream>>>(
+            T, C, H, reinterpret_cast<half*>(state.data_ptr()),
+            reinterpret_cast<const half*>(r.data_ptr()),
+            reinterpret_cast<const half*>(w.data_ptr()), nullptr,
+            reinterpret_cast<const half*>(k.data_ptr()),
+            reinterpret_cast<const half*>(v.data_ptr()),
+            reinterpret_cast<const half*>(a.data_ptr()),
+            reinterpret_cast<const half*>(b.data_ptr()),
+            reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>());
+      }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  if (T == 1) {
+    wkv_one_v2_cuda_impl(
+        B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t);
+    return;
+  }
+  const dim3 grid(B * H);
+  const bool use_seq_v2 = use_v2_seq(B, T);
+  if (use_seq_v2) {
+    if (add_w0) {
+      wkv_fp16_seq_v2_kernel<true, false><<<grid, dim3(N), 0, stream>>>(
           T, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -660,7 +931,7 @@ void wkv_seq_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_seq_v2_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_seq_v2_kernel<false, false><<<grid, dim3(N), 0, stream>>>(
           T, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -675,7 +946,7 @@ void wkv_seq_v2_cuda_impl(
     }
   } else {
     if (add_w0) {
-      wkv_fp16_v1_exact_kernel<false, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_exact_kernel<false, true, false><<<grid, dim3(N), 0, stream>>>(
           B, T, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -688,7 +959,7 @@ void wkv_seq_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_v1_exact_kernel<false, false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_exact_kernel<false, false, false><<<grid, dim3(N), 0, stream>>>(
           B, T, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -703,6 +974,26 @@ void wkv_seq_v2_cuda_impl(
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void wkv_seq_v2_cuda_impl(
+    int B,
+    int T,
+    int C,
+    int H,
+    at::Tensor state,
+    at::Tensor r,
+    at::Tensor w,
+    const half* w0_ptr,
+    bool add_w0,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor y,
+    at::Tensor elapsed_t) {
+  launch_wkv_seq_v2_cuda_impl(
+      B, T, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t);
 }
 
 void wkv_seq_v2_cuda(
@@ -773,7 +1064,7 @@ void wkv_one_w0_v2_cuda(
   wkv_one_v2_cuda_impl(B, C, H, state, r, w, reinterpret_cast<const half*>(w0.data_ptr()), true, k, v, a, b, y, elapsed_t);
 }
 
-void wkv_one_v2_cuda_impl(
+void launch_wkv_one_v2_cuda_impl(
     int B,
     int C,
     int H,
@@ -790,9 +1081,10 @@ void wkv_one_v2_cuda_impl(
     at::Tensor elapsed_t) {
   assert(C == H * N);
   auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(B * H);
   if (B <= 2) {
     if (add_w0) {
-      wkv_fp16_v1_clone_kernel<true, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, true, false><<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -805,7 +1097,7 @@ void wkv_one_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_v1_clone_kernel<true, false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, false, false><<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -820,7 +1112,7 @@ void wkv_one_v2_cuda_impl(
     }
   } else if (B <= 64) {
     if (add_w0) {
-      wkv_fp16_one_cp_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_cp_kernel<true, false><<<grid, dim3(N), 0, stream>>>(
           C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -833,7 +1125,7 @@ void wkv_one_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_one_cp_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_cp_kernel<false, false><<<grid, dim3(N), 0, stream>>>(
           C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -848,7 +1140,7 @@ void wkv_one_v2_cuda_impl(
     }
   } else if (B <= 128) {
     if (add_w0) {
-      wkv_fp16_one_direct_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_direct_kernel<true, false><<<grid, dim3(N), 0, stream>>>(
           C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -861,7 +1153,7 @@ void wkv_one_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_one_direct_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_direct_kernel<false, false><<<grid, dim3(N), 0, stream>>>(
           C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -876,7 +1168,7 @@ void wkv_one_v2_cuda_impl(
     }
   } else {
     if (add_w0) {
-      wkv_fp16_v1_clone_kernel<true, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, true, false><<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -889,7 +1181,7 @@ void wkv_one_v2_cuda_impl(
           reinterpret_cast<half*>(y.data_ptr()),
           elapsed_t.data_ptr<int>());
     } else {
-      wkv_fp16_v1_clone_kernel<true, false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, false, false><<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H,
           reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
@@ -904,4 +1196,23 @@ void wkv_one_v2_cuda_impl(
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void wkv_one_v2_cuda_impl(
+    int B,
+    int C,
+    int H,
+    at::Tensor state,
+    at::Tensor r,
+    at::Tensor w,
+    const half* w0_ptr,
+    bool add_w0,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor y,
+    at::Tensor elapsed_t) {
+  launch_wkv_one_v2_cuda_impl(
+      B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t);
 }

@@ -59,24 +59,26 @@ __device__ __forceinline__ float bf16_bits_to_float_dev(uint16_t bits) {
 }
 
 template <int Threads>
-__device__ __forceinline__ float block_sum_t(float x) {
-  __shared__ float partial[Threads / 32];
+__device__ __forceinline__ float block_sum_t(float x, int slot = 0) {
+  // Paired reductions must not reuse a shared row: the next reduction may
+  // overwrite partial[0] before every thread has read the previous result.
+  __shared__ float partial[2][Threads / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   x = warp_sum(x);
   if (lane == 0) {
-    partial[warp] = x;
+    partial[slot][warp] = x;
   }
   __syncthreads();
-  x = (threadIdx.x < (Threads / 32)) ? partial[lane] : 0.0f;
+  x = (threadIdx.x < (Threads / 32)) ? partial[slot][lane] : 0.0f;
   if (warp == 0) {
     x = warp_sum(x);
   }
   if (threadIdx.x == 0) {
-    partial[0] = x;
+    partial[slot][0] = x;
   }
   __syncthreads();
-  return partial[0];
+  return partial[slot][0];
 }
 
 __global__ void emb_ln0_bf16_to_f16_kernel(
@@ -98,13 +100,13 @@ __global__ void emb_ln0_bf16_to_f16_kernel(
   for (int c = tid; c < C; c += blockDim.x) {
     sum += bf16_bits_to_float_dev(er[c]);
   }
-  const float mean = block_sum_t<256>(sum) / static_cast<float>(C);
+  const float mean = block_sum_t<256>(sum, 0) / static_cast<float>(C);
   float var = 0.0f;
   for (int c = tid; c < C; c += blockDim.x) {
     const float d = bf16_bits_to_float_dev(er[c]) - mean;
     var += d * d;
   }
-  const float rstd = rsqrtf(block_sum_t<256>(var) / static_cast<float>(C) + eps);
+  const float rstd = rsqrtf(block_sum_t<256>(var, 1) / static_cast<float>(C) + eps);
   dtype* yr = out + static_cast<int64_t>(tok) * C;
   for (int c = tid; c < C; c += blockDim.x) {
     const float x = bf16_bits_to_float_dev(er[c]);
@@ -1394,7 +1396,7 @@ __global__ void layer_norm_f16_kernel(
     const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c));
     sum += v;
   }
-  sum = block_sum_t<LN_THREADS>(sum);
+  sum = block_sum_t<LN_THREADS>(sum, 0);
   const float inv_c = 1.0f / static_cast<float>(C);
   const float mean = sum * inv_c;
   float sum_var = 0.0f;
@@ -1403,7 +1405,7 @@ __global__ void layer_norm_f16_kernel(
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  sum_var = block_sum_t<LN_THREADS>(sum_var, 1);
   const float var = sum_var * inv_c;
   const float rstd = rsqrtf(var + eps);
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
@@ -1435,7 +1437,7 @@ __global__ void add_layer_norm_f16_kernel(
                     __half2float(*reinterpret_cast<const __half*>(residual + base + c));
     sum += v;
   }
-  sum = block_sum_t<LN_THREADS>(sum);
+  sum = block_sum_t<LN_THREADS>(sum, 0);
   const float inv_c = 1.0f / static_cast<float>(C);
   const float mean = sum * inv_c;
   float sum_var = 0.0f;
@@ -1445,7 +1447,7 @@ __global__ void add_layer_norm_f16_kernel(
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  sum_var = block_sum_t<LN_THREADS>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * inv_c + eps);
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
     const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
@@ -1486,7 +1488,7 @@ __global__ __launch_bounds__(Threads, 1) void layer_norm_f16_small_kernel(
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -1507,7 +1509,7 @@ __global__ __launch_bounds__(Threads, 1) void layer_norm_f16_small_kernel(
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -1565,7 +1567,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_f16_small_kernel(
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -1588,7 +1590,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_f16_small_kernel(
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -1646,7 +1648,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_kernel
     const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
     sum += xv.x + rv.x + xv.y + rv.y;
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1660,7 +1662,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_kernel
     const float d1 = x1 - mean;
     sum_var += d0 * d0 + d1 * d1;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -1708,7 +1710,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_scalar
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1719,7 +1721,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_scalar
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -1777,7 +1779,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_kerne
     const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
     sum += xv.x + rv.x + xv.y + rv.y;
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1791,7 +1793,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_kerne
     const float d1 = x1 - mean;
     sum_var += d0 * d0 + d1 * d1;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -1860,7 +1862,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_scala
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
 #pragma unroll
@@ -1871,7 +1873,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_scala
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 #pragma unroll
   for (int k = 0; k < pairs / Threads; ++k) {
@@ -1938,7 +1940,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_small_kern
       sum += v;
     }
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum * (1.0f / static_cast<float>(LN_SMALL_C));
   float sum_var = 0.0f;
   if constexpr (VecStats) {
@@ -1961,7 +1963,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_small_kern
       sum_var += d * d;
     }
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
   if constexpr (VecOut) {
 #pragma unroll
@@ -2012,7 +2014,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_generic_ke
     sum += __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + src + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2021,7 +2023,7 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_generic_ke
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   for (int p = threadIdx.x; p < pairs; p += Threads) {
@@ -2060,7 +2062,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_generi
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2069,7 +2071,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_generi
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   const int64_t base2 = base >> 1;
@@ -2124,7 +2126,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_gener
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(residual + base + c));
   }
-  sum = block_sum_t<Threads>(sum);
+  sum = block_sum_t<Threads>(sum, 0);
   const float mean = sum / static_cast<float>(C);
   float sum_var = 0.0f;
   for (int c = threadIdx.x; c < C; c += Threads) {
@@ -2133,7 +2135,7 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_gener
     const float d = v - mean;
     sum_var += d * d;
   }
-  sum_var = block_sum_t<Threads>(sum_var);
+  sum_var = block_sum_t<Threads>(sum_var, 1);
   const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
   const int pairs = C >> 1;
   const int64_t base2 = base >> 1;
