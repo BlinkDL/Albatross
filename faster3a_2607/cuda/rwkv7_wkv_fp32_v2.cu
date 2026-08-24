@@ -42,24 +42,27 @@ __device__ __forceinline__ float warp_sum_broadcast(float x) {
   return __shfl_sync(0xffffffffu, warp_sum(x), 0);
 }
 
-__device__ __forceinline__ float block_sum_broadcast(float x) {
-  __shared__ float partial[BLOCK_THREADS / WARP_THREADS];
+__device__ __forceinline__ float block_sum_broadcast(float x, int slot) {
+  // The next reduction may overwrite shared memory before every lane has
+  // consumed the returned scalar. Consecutive sa/yy reductions use slots 0/1;
+  // the loop-end CTA barrier protects reuse by the next token.
+  __shared__ float partial[2][BLOCK_THREADS / WARP_THREADS];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   x = warp_sum(x);
   if (lane == 0) {
-    partial[warp] = x;
+    partial[slot][warp] = x;
   }
   __syncthreads();
-  x = (threadIdx.x < (BLOCK_THREADS / WARP_THREADS)) ? partial[lane] : 0.0f;
+  x = (threadIdx.x < (BLOCK_THREADS / WARP_THREADS)) ? partial[slot][lane] : 0.0f;
   if (warp == 0) {
     x = warp_sum(x);
   }
   if (threadIdx.x == 0) {
-    partial[0] = x;
+    partial[slot][0] = x;
   }
   __syncthreads();
-  return partial[0];
+  return partial[slot][0];
 }
 
 template <int HeadSize>
@@ -197,7 +200,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kern
     for (int j = tid; j < N; j += BLOCK_THREADS) {
       sa += state_ptr[state_base + j] * load_io(a_ptr, token + j);
     }
-    sa = block_sum_broadcast(sa);
+    sa = block_sum_broadcast(sa, 0);
 
     float yy = 0.0f;
     const float vv = load_io(v_ptr, token + row);
@@ -207,7 +210,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kern
       state_ptr[state_base + j] = s;
       yy += s * load_io(r_ptr, idx);
     }
-    yy = block_sum_broadcast(yy);
+    yy = block_sum_broadcast(yy, 1);
     if (tid == 0) {
       y_ptr[token + row] = float_to_io(yy);
     }
