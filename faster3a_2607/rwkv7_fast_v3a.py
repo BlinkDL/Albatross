@@ -21,6 +21,7 @@ CUTLASS_INCLUDE_DIR = Path(os.environ.get(
 ))
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
+WKV_STATE_LAYOUT = "kv_v2"
 WKV_FP16_POLICY = "tuned"
 WKV_BH_GRID_MODE = "tuned"
 # DeltaLog is opt-in because append phases intentionally keep wkv_state as a
@@ -84,6 +85,38 @@ WKV_DELTALOG_APW_TUNED = {
     (2048, 64): (3, "model_slot_layer_packed", "slot0"),
     (2048, 128): (3, "model_slot_packed", "slot0"),
 }
+
+
+def convert_wkv_state_layout(
+    state: list,
+    source_layout: str,
+    target_layout: str = WKV_STATE_LAYOUT,
+) -> list:
+    """Return a state list whose WKV matrices use the requested physical ABI."""
+    layouts = {"vk_v1", "kv_v2"}
+    if source_layout not in layouts or target_layout not in layouts:
+        raise ValueError(
+            f"unsupported WKV state layout: {source_layout} -> {target_layout}")
+    if source_layout == target_layout:
+        return state
+    if len(state) != 3:
+        raise ValueError("RWKV state must contain shift, WKV, and elapsed entries")
+
+    def transpose_wkv(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim < 2 or tensor.shape[-2:] != (HEAD_SIZE, HEAD_SIZE):
+            raise ValueError("WKV state matrices must end in [64,64]")
+        return tensor.transpose(-1, -2).contiguous()
+
+    converted = list(state)
+    wkv = state[1]
+    converted[1] = (
+        [transpose_wkv(layer_state) for layer_state in wkv]
+        if isinstance(wkv, list)
+        else transpose_wkv(wkv)
+    )
+    return converted
+
+
 ADD_VEC_MODE = "tuned"
 LAST_LN_MODE = "indexed"
 LNX_MODE = "tuned"
@@ -438,6 +471,9 @@ WKV_FP16_PATH_OVERRIDES_BY_C = {
     4096: {
         **{bt: (w0_mode, kernel_mode, "2d")
            for bt, (w0_mode, kernel_mode) in WKV_FP16_TUNED_OVERRIDES.items()},
+        # Dual-GPU 8x5 E2E: seq/2D was +0.016%/+0.037% over seq/flat.
+        # Keep this exact-shape guard; the same launch choice is noise at T=8.
+        (1, 16): ("fused", "seq", "2d"),
         # This replaces the older fused/exact/2D owner at the same shape.
         # Both capture orders were positive on both 7.2B and 13.3B; the flat
         # seq path changes reduction association but keeps disjoint owners.
@@ -620,7 +656,7 @@ def main() -> None:
         parser.error("--deltalog is BnT1-only; the CLI eval paths use B1 and are not tuned")
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} deltalog={'on' if args.deltalog else 'off'} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_state_layout={WKV_STATE_LAYOUT} deltalog={'on' if args.deltalog else 'off'} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS} t512_acc2=exact_BT t512_reuse=exact_BT")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -1066,6 +1102,7 @@ class RWKV7:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
         torch._C._jit_set_autocast_mode(False)
+        self.wkv_state_layout = WKV_STATE_LAYOUT
 
         t0 = time.perf_counter()
         log(f"loading weights from {MODEL_PATH}")
@@ -1187,6 +1224,7 @@ class RWKV7:
         return workspace
 
     def zero_state(self, B: int) -> list[torch.Tensor]:
+        # A zero matrix is layout-invariant; every WKV path writes it as kv_v2.
         if pp_enabled():
             shift = []
             wkv = []

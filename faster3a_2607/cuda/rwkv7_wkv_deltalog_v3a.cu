@@ -13,6 +13,14 @@ namespace {
 constexpr int N = 64;
 constexpr int HALF2_N = N / 2;
 constexpr int LDG_ELEMS = sizeof(int4) / sizeof(half);
+
+#ifndef RWKV_DELTALOG_VECTOR_APPEND_THRESHOLD
+#define RWKV_DELTALOG_VECTOR_APPEND_THRESHOLD 32768
+#endif
+
+#ifndef RWKV_DELTALOG_WARP_MERGE_THRESHOLD
+#define RWKV_DELTALOG_WARP_MERGE_THRESHOLD 16384
+#endif
 constexpr float TWO_NEG_41 = 4.547473508864641e-13f;
 constexpr float NEXP_HALF_LOG2_E = -0.8750387749145276f;
 constexpr float NLOG2_E = -1.4426950408889634f;
@@ -44,7 +52,20 @@ __device__ __forceinline__ half warp_dot(half2 left, half2 right) {
   return __float2half_rn(warp_sum(local));
 }
 
-template <int LIVE>
+__device__ __forceinline__ half2 load_state_kv(
+    const half* __restrict__ state_base, int value, int key2) {
+  return __halves2half2(
+      __ldg(state_base + (2 * key2) * N + value),
+      __ldg(state_base + (2 * key2 + 1) * N + value));
+}
+
+__device__ __forceinline__ void store_state_kv(
+    half* __restrict__ state_base, int value, int key2, half2 state) {
+  state_base[(2 * key2) * N + value] = state.x;
+  state_base[(2 * key2 + 1) * N + value] = state.y;
+}
+
+template <int LIVE, bool VectorState>
 __global__ __launch_bounds__(N, 1) void deltalog_append_kernel(
     int C,
     int H,
@@ -73,7 +94,7 @@ __global__ __launch_bounds__(N, 1) void deltalog_append_kernel(
   const int64_t token = static_cast<int64_t>(batch) * C + h * N;
   const int64_t state_offset = token * N;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
+  __shared__ __align__(256) half2 state_smem[VectorState ? N : 1][HALF2_N];
   __shared__ __align__(128) half2 cur_r[HALF2_N], cur_a[HALF2_N];
   __shared__ __align__(128) half2 cur_b[HALF2_N], cur_k[HALF2_N], cur_delta[HALF2_N];
   __shared__ __align__(128) half2 hist_delta[LIVE > 0 ? LIVE : 1][HALF2_N];
@@ -84,14 +105,22 @@ __global__ __launch_bounds__(N, 1) void deltalog_append_kernel(
   __shared__ half coeff_k[2][LIVE > 0 ? LIVE : 1];
   __shared__ half current_br, current_kr;
 
+  if constexpr (VectorState) {
+    // Mapping is correctness-critical: global is [K,V], registers are V-owned.
+    // Each int4 is one contiguous V segment and shared performs the transpose.
 #pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    const int4 state_vec = reinterpret_cast<const int4*>(base_state + state_offset)[j0 * N + tid];
+    for (int flat4 = tid; flat4 < N * N / LDG_ELEMS; flat4 += N) {
+      const int4 state_vec =
+          reinterpret_cast<const int4*>(base_state + state_offset)[flat4];
+      const int key = flat4 >> 3;
+      const int value0 = (flat4 & 7) * LDG_ELEMS;
 #pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      const int row = j0 * LDG_ELEMS + tid * LDG_ELEMS / N;
-      const int col = tid * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row & 31) ^ col] = reinterpret_cast<const half2*>(&state_vec)[j1];
+      for (int q = 0; q < LDG_ELEMS; ++q) {
+        const int value = value0 + q;
+        half* const dst = reinterpret_cast<half*>(
+            &state_smem[value][(value & 31) ^ (key >> 1)]);
+        dst[key & 1] = reinterpret_cast<const half*>(&state_vec)[q];
+      }
     }
   }
 
@@ -121,7 +150,11 @@ __global__ __launch_bounds__(N, 1) void deltalog_append_kernel(
   half2 state[HALF2_N];
 #pragma unroll
   for (int col2 = 0; col2 < HALF2_N; ++col2) {
-    state[col2] = state_smem[tid][lane ^ col2];
+    if constexpr (VectorState) {
+      state[col2] = state_smem[tid][lane ^ col2];
+    } else {
+      state[col2] = load_state_kv(base_state + state_offset, tid, col2);
+    }
   }
 
   half2 query = warp == 0 ? cur_a[lane] : __hfma2(cur_r[lane], cur_delta[lane], cur_r[lane]);
@@ -207,23 +240,12 @@ __global__ __launch_bounds__(N, 1) void deltalog_merge_kernel(
   const int64_t token = static_cast<int64_t>(batch) * C + h * N;
   const int64_t state_offset = token * N;
 
-  __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   __shared__ __align__(128) half2 cur_r[HALF2_N], cur_a[HALF2_N];
   __shared__ __align__(128) half2 cur_b[HALF2_N], cur_k[HALF2_N], cur_delta[HALF2_N];
   __shared__ __align__(128) half2 hist_delta[M - 1][HALF2_N];
   __shared__ __align__(128) half2 hist_b[M - 1][HALF2_N];
   __shared__ __align__(128) half2 hist_k[M - 1][HALF2_N];
 
-#pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    const int4 state_vec = reinterpret_cast<const int4*>(base_state + state_offset)[j0 * N + tid];
-#pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      const int row = j0 * LDG_ELEMS + tid * LDG_ELEMS / N;
-      const int col = tid * LDG_ELEMS % N / 2 + j1;
-      state_smem[row][(row & 31) ^ col] = reinterpret_cast<const half2*>(&state_vec)[j1];
-    }
-  }
   if (tid < HALF2_N) {
     const int64_t idx2 = (token >> 1) + tid;
     cur_r[tid] = reinterpret_cast<const half2*>(r_ptr)[idx2];
@@ -250,7 +272,7 @@ __global__ __launch_bounds__(N, 1) void deltalog_merge_kernel(
   half2 state[HALF2_N];
 #pragma unroll
   for (int col2 = 0; col2 < HALF2_N; ++col2) {
-    state[col2] = state_smem[tid][lane ^ col2];
+    state[col2] = load_state_kv(base_state + state_offset, tid, col2);
   }
 #pragma unroll
   for (int slot = 0; slot < M - 1; ++slot) {
@@ -294,19 +316,137 @@ __global__ __launch_bounds__(N, 1) void deltalog_merge_kernel(
 
 #pragma unroll
   for (int col2 = 0; col2 < HALF2_N; ++col2) {
-    state_smem[tid][lane ^ col2] = state[col2];
+    store_state_kv(base_state + state_offset, tid, col2, state[col2]);
   }
-  __syncthreads();
+}
+
+template <int M>
+__global__ __launch_bounds__(32, 8) void deltalog_merge_warp_pair_kernel(
+    int C,
+    int H,
+    int64_t log_stride,
+    half* __restrict__ base_state,
+    const half* __restrict__ log_delta,
+    const half* __restrict__ log_u,
+    const half* __restrict__ log_b,
+    const half* __restrict__ log_k,
+    const half* __restrict__ log_v,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ w_ptr,
+    const half* __restrict__ w0_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ y_ptr,
+    const int* __restrict__ elapsed_t) {
+  static_assert(M >= 2 && M <= 8);
+  const int head = blockIdx.x;
+  const int batch = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int64_t token = static_cast<int64_t>(batch) * C + head * N;
+  const int64_t state_offset = token * N;
+  const int value0 = 2 * lane;
+
+  __shared__ __align__(128) half2 cur_r[HALF2_N], cur_a[HALF2_N];
+  __shared__ __align__(128) half2 cur_b[HALF2_N], cur_k[HALF2_N];
+  __shared__ __align__(128) half2 cur_delta[HALF2_N];
+  __shared__ __align__(128) half2 hist_delta[M - 1][HALF2_N];
+  __shared__ __align__(128) half2 hist_b[M - 1][HALF2_N];
+  __shared__ __align__(128) half2 hist_k[M - 1][HALF2_N];
+
+  const int64_t idx2 = (token >> 1) + lane;
+  cur_r[lane] = reinterpret_cast<const half2*>(r_ptr)[idx2];
+  cur_a[lane] = reinterpret_cast<const half2*>(a_ptr)[idx2];
+  cur_b[lane] = reinterpret_cast<const half2*>(b_ptr)[idx2];
+  cur_k[lane] = reinterpret_cast<const half2*>(k_ptr)[idx2];
+  const half2 raw_w = reinterpret_cast<const half2*>(w_ptr)[idx2];
+  const half2 w0 = reinterpret_cast<const half2*>(w0_ptr + head * N)[lane];
+  const int phase0 = elapsed_t[batch] + head * N + 2 * lane;
+  cur_delta[lane] = {
+      make_delta(raw_w.x, w0.x, phase0),
+      make_delta(raw_w.y, w0.y, phase0 + 1)};
+  for (int flat = lane; flat < (M - 1) * HALF2_N; flat += 32) {
+    const int slot = flat / HALF2_N;
+    const int key2 = flat % HALF2_N;
+    const int64_t hist_idx2 =
+        ((static_cast<int64_t>(slot) * log_stride + token) >> 1) + key2;
+    hist_delta[slot][key2] = reinterpret_cast<const half2*>(log_delta)[hist_idx2];
+    hist_b[slot][key2] = reinterpret_cast<const half2*>(log_b)[hist_idx2];
+    hist_k[slot][key2] = reinterpret_cast<const half2*>(log_k)[hist_idx2];
+  }
+  __syncwarp();
+
+  half2 state[N];
 #pragma unroll
-  for (int j0 = 0; j0 < N / LDG_ELEMS; ++j0) {
-    int4 state_vec;
+  for (int key = 0; key < N; ++key) {
+    state[key] = __ldg(
+        reinterpret_cast<const half2*>(base_state + state_offset + key * N) + lane);
+  }
+
 #pragma unroll
-    for (int j1 = 0; j1 < LDG_ELEMS / 2; ++j1) {
-      const int row = j0 * LDG_ELEMS + tid * LDG_ELEMS / N;
-      const int col = tid * LDG_ELEMS % N / 2 + j1;
-      reinterpret_cast<half2*>(&state_vec)[j1] = state_smem[row][(row & 31) ^ col];
+  for (int slot = 0; slot < M - 1; ++slot) {
+    const int64_t row_idx =
+        static_cast<int64_t>(slot) * log_stride + token + value0;
+    const half2 old_u =
+        __ldg(reinterpret_cast<const half2*>(log_u + row_idx));
+    const half2 old_v =
+        __ldg(reinterpret_cast<const half2*>(log_v + row_idx));
+#pragma unroll
+    for (int key2 = 0; key2 < HALF2_N; ++key2) {
+      const half2 delta = hist_delta[slot][key2];
+      const half2 bv = hist_b[slot][key2];
+      const half2 kv = hist_k[slot][key2];
+      half2& even = state[2 * key2];
+      half2& odd = state[2 * key2 + 1];
+      even = __hfma2(
+          even, __halves2half2(delta.x, delta.x),
+          __hfma2(__halves2half2(kv.x, kv.x), old_v,
+                  __hfma2(old_u, __halves2half2(bv.x, bv.x), even)));
+      odd = __hfma2(
+          odd, __halves2half2(delta.y, delta.y),
+          __hfma2(__halves2half2(kv.y, kv.y), old_v,
+                  __hfma2(old_u, __halves2half2(bv.y, bv.y), odd)));
     }
-    reinterpret_cast<int4*>(base_state + state_offset)[j0 * N + tid] = state_vec;
+  }
+
+  half2 u_even = __float2half2_rn(0.0f);
+  half2 u_odd = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key2 = 0; key2 < HALF2_N; ++key2) {
+    const half2 av = cur_a[key2];
+    u_even = __hfma2(state[2 * key2], __halves2half2(av.x, av.x), u_even);
+    u_odd = __hfma2(state[2 * key2 + 1], __halves2half2(av.y, av.y), u_odd);
+  }
+  const half2 u = __hadd2(u_even, u_odd);
+  const half2 current_v =
+      __ldg(reinterpret_cast<const half2*>(v_ptr + token) + lane);
+  half2 y_even = __float2half2_rn(0.0f);
+  half2 y_odd = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key2 = 0; key2 < HALF2_N; ++key2) {
+    const half2 delta = cur_delta[key2];
+    const half2 bv = cur_b[key2];
+    const half2 kv = cur_k[key2];
+    const half2 rv = cur_r[key2];
+    half2& even = state[2 * key2];
+    half2& odd = state[2 * key2 + 1];
+    even = __hfma2(
+        even, __halves2half2(delta.x, delta.x),
+        __hfma2(__halves2half2(kv.x, kv.x), current_v,
+                __hfma2(u, __halves2half2(bv.x, bv.x), even)));
+    odd = __hfma2(
+        odd, __halves2half2(delta.y, delta.y),
+        __hfma2(__halves2half2(kv.y, kv.y), current_v,
+                __hfma2(u, __halves2half2(bv.y, bv.y), odd)));
+    y_even = __hfma2(even, __halves2half2(rv.x, rv.x), y_even);
+    y_odd = __hfma2(odd, __halves2half2(rv.y, rv.y), y_odd);
+  }
+  reinterpret_cast<half2*>(y_ptr + token)[lane] = __hadd2(y_even, y_odd);
+
+#pragma unroll
+  for (int key = 0; key < N; ++key) {
+    reinterpret_cast<half2*>(base_state + state_offset + key * N)[lane] = state[key];
   }
 }
 
@@ -335,22 +475,38 @@ void launch_step(
   auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(H, B, 1);
   if (phase == M - 1) {
-    deltalog_merge_kernel<M><<<grid, N, 0, stream>>>(
-        C, H, log_stride,
-        reinterpret_cast<half*>(base_state.data_ptr()),
-        log_delta, log_u, log_b, log_k, log_v,
-        reinterpret_cast<const half*>(r.data_ptr()),
-        reinterpret_cast<const half*>(w.data_ptr()),
-        reinterpret_cast<const half*>(w0.data_ptr()),
-        reinterpret_cast<const half*>(k.data_ptr()),
-        reinterpret_cast<const half*>(v.data_ptr()),
-        reinterpret_cast<const half*>(a.data_ptr()),
-        reinterpret_cast<const half*>(b.data_ptr()),
-        reinterpret_cast<half*>(y.data_ptr()),
-        elapsed_t.data_ptr<int>());
+    if (B * H <= RWKV_DELTALOG_WARP_MERGE_THRESHOLD) {
+      deltalog_merge_warp_pair_kernel<M><<<grid, 32, 0, stream>>>(
+          C, H, log_stride,
+          reinterpret_cast<half*>(base_state.data_ptr()),
+          log_delta, log_u, log_b, log_k, log_v,
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(w.data_ptr()),
+          reinterpret_cast<const half*>(w0.data_ptr()),
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(y.data_ptr()),
+          elapsed_t.data_ptr<int>());
+    } else {
+      deltalog_merge_kernel<M><<<grid, N, 0, stream>>>(
+          C, H, log_stride,
+          reinterpret_cast<half*>(base_state.data_ptr()),
+          log_delta, log_u, log_b, log_k, log_v,
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(w.data_ptr()),
+          reinterpret_cast<const half*>(w0.data_ptr()),
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(y.data_ptr()),
+          elapsed_t.data_ptr<int>());
+    }
   } else {
-#define LAUNCH_APPEND(LIVE) \
-    deltalog_append_kernel<LIVE><<<grid, N, 0, stream>>>( \
+#define LAUNCH_APPEND(LIVE, VectorState) \
+    deltalog_append_kernel<LIVE, VectorState><<<grid, N, 0, stream>>>( \
         C, H, log_stride, \
         reinterpret_cast<const half*>(base_state.data_ptr()), \
         log_delta, log_u, log_b, log_k, log_v, \
@@ -363,16 +519,26 @@ void launch_step(
         reinterpret_cast<const half*>(b.data_ptr()), \
         reinterpret_cast<half*>(y.data_ptr()), \
         elapsed_t.data_ptr<int>())
-    switch (phase) {
-      case 0: LAUNCH_APPEND(0); break;
-      case 1: LAUNCH_APPEND(1); break;
-      case 2: LAUNCH_APPEND(2); break;
-      case 3: LAUNCH_APPEND(3); break;
-      case 4: LAUNCH_APPEND(4); break;
-      case 5: LAUNCH_APPEND(5); break;
-      case 6: LAUNCH_APPEND(6); break;
-      default: TORCH_CHECK(false, "invalid append phase");
+#define DISPATCH_APPEND(VectorState) \
+    switch (phase) { \
+      case 0: LAUNCH_APPEND(0, VectorState); break; \
+      case 1: LAUNCH_APPEND(1, VectorState); break; \
+      case 2: LAUNCH_APPEND(2, VectorState); break; \
+      case 3: LAUNCH_APPEND(3, VectorState); break; \
+      case 4: LAUNCH_APPEND(4, VectorState); break; \
+      case 5: LAUNCH_APPEND(5, VectorState); break; \
+      case 6: LAUNCH_APPEND(6, VectorState); break; \
+      default: TORCH_CHECK(false, "invalid append phase"); \
     }
+    // Shared-vector append only enters above the C4096/B512 boundary.  At the
+    // two exact boundaries (B256 and B512), its component gain was erased or
+    // reversed by the real model pass; scalar append keeps the [K,V] ABI gain.
+    if (B * H > RWKV_DELTALOG_VECTOR_APPEND_THRESHOLD) {
+      DISPATCH_APPEND(true);
+    } else {
+      DISPATCH_APPEND(false);
+    }
+#undef DISPATCH_APPEND
 #undef LAUNCH_APPEND
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
