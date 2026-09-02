@@ -179,6 +179,87 @@ void wkv_grouped_w0_forced_v2_cuda(
     torch::Tensor y,
     torch::Tensor elapsed_t);
 
+void wkv_kv_warp_spill_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    int keep_keys,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
+void wkv_kv_warp_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
+void wkv_kv_vector_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
+void wkv_kv_vector_flat_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
+void wkv_kv_staged_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t);
+
 void wkv_seq(
     int64_t B,
     int64_t T,
@@ -337,8 +418,8 @@ void wkv_seq_grid2d(
     torch::Tensor v,
     torch::Tensor a,
     torch::Tensor b,
-    torch::Tensor y,
-    torch::Tensor elapsed_t) {
+  torch::Tensor y,
+  torch::Tensor elapsed_t) {
   check_grid2d_dims(B, T, C, H);
   check_grid2d_tensors(B, T, C, state, r, w, nullptr, k, v, a, b, y, elapsed_t);
   wkv_seq_grid2d_v2_cuda(
@@ -571,6 +652,105 @@ void wkv_grouped_w0_forced(
       static_cast<int>(rows_per_cta), state, r, w, w0, k, v, a, b, y, elapsed_t);
 }
 
+void wkv_kv_warp_spill_w0(
+    int64_t B,
+    int64_t T,
+    int64_t C,
+    int64_t H,
+    int64_t keep_keys,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  TORCH_CHECK(T == 1, "wkv_kv_warp_spill_w0 is admitted only for T=1");
+  TORCH_CHECK(keep_keys == 16 || keep_keys == 32 || keep_keys == 48,
+              "keep_keys must be 16, 32, or 48");
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_kv_warp_spill_w0_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+      static_cast<int>(H), static_cast<int>(keep_keys), state, r, w, w0,
+      k, v, a, b, y, elapsed_t);
+}
+
+void wkv_kv_warp_w0(
+    int64_t B,
+    int64_t T,
+    int64_t C,
+    int64_t H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  // The direct kernel owns one complete (B,H) state and advances T serially.
+  // T>1 is race-free, but Python must keep it behind exact device/shape gates.
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_kv_warp_w0_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+      static_cast<int>(H), state, r, w, w0, k, v, a, b, y, elapsed_t);
+}
+
+void wkv_kv_vector_w0(
+    int64_t B,
+    int64_t T,
+    int64_t C,
+    int64_t H,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor w0,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_kv_vector_w0_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+      static_cast<int>(H), state, r, w, w0, k, v, a, b, y, elapsed_t);
+}
+
+void wkv_kv_vector_flat_w0(
+    int64_t B, int64_t T, int64_t C, int64_t H,
+    torch::Tensor state, torch::Tensor r, torch::Tensor w,
+    torch::Tensor w0, torch::Tensor k, torch::Tensor v,
+    torch::Tensor a, torch::Tensor b, torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_kv_vector_flat_w0_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+      static_cast<int>(H), state, r, w, w0, k, v, a, b, y, elapsed_t);
+}
+
+void wkv_kv_staged_w0(
+    int64_t B, int64_t T, int64_t C, int64_t H,
+    torch::Tensor state, torch::Tensor r, torch::Tensor w,
+    torch::Tensor w0, torch::Tensor k, torch::Tensor v,
+    torch::Tensor a, torch::Tensor b, torch::Tensor y,
+    torch::Tensor elapsed_t) {
+  check_grid2d_dims(B, T, C, H);
+  check_grid2d_tensors(B, T, C, state, r, w, &w0, k, v, a, b, y, elapsed_t);
+  wkv_kv_staged_w0_v2_cuda(
+      static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+      static_cast<int>(H), state, r, w, w0, k, v, a, b, y, elapsed_t);
+}
+
 TORCH_LIBRARY(rwkv7_wkv_fp16_v2, m) {
   m.def("wkv_seq", wkv_seq);
   m.def("wkv_seq_w0", wkv_seq_w0);
@@ -585,4 +765,11 @@ TORCH_LIBRARY(rwkv7_wkv_fp16_v2, m) {
   m.def("wkv_seq_grid2d_forced", wkv_seq_grid2d_forced);
   m.def("wkv_seq_w0_grid2d_forced", wkv_seq_w0_grid2d_forced);
   m.def("wkv_grouped_w0_forced", wkv_grouped_w0_forced);
+  // Direct KV schedules are production-capable only through exact Python
+  // device/shape gates; these wrappers independently reject unsafe ABIs.
+  m.def("wkv_kv_warp_w0", wkv_kv_warp_w0);
+  m.def("wkv_kv_warp_spill_w0", wkv_kv_warp_spill_w0);
+  m.def("wkv_kv_vector_w0", wkv_kv_vector_w0);
+  m.def("wkv_kv_vector_flat_w0", wkv_kv_vector_flat_w0);
+  m.def("wkv_kv_staged_w0", wkv_kv_staged_w0);
 }

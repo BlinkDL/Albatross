@@ -151,11 +151,44 @@ void forward_block(
   wkv_fp32_v2_cuda(static_cast<int>(B), static_cast<int>(T), static_cast<int>(C), static_cast<int>(H), 3, state, r, w, k, v, a, b, y);
 }
 
+void forward_mode(
+    int64_t B,
+    int64_t T,
+    int64_t C,
+    int64_t H,
+    int64_t mode,
+    torch::Tensor state,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y) {
+  TORCH_CHECK(mode >= 0 && mode <= 9, "WKV mode must be in [0,9]");
+  check_inputs(B, T, C, H, state, r, w, k, v, a, b, y);
+  wkv_fp32_v2_cuda(
+      static_cast<int>(B),
+      static_cast<int>(T),
+      static_cast<int>(C),
+      static_cast<int>(H),
+      static_cast<int>(mode),
+      state,
+      r,
+      w,
+      k,
+      v,
+      a,
+      b,
+      y);
+}
+
 TORCH_LIBRARY(rwkv7_wkv_fp32_v2, m) {
   m.def("forward(int B, int T, int C, int H, Tensor(a!) state, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
   m.def("forward_seq(int B, int T, int C, int H, Tensor(a!) state, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
   m.def("forward_small(int B, int T, int C, int H, Tensor(a!) state, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
   m.def("forward_block(int B, int T, int C, int H, Tensor(a!) state, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
+  m.def("forward_mode(int B, int T, int C, int H, int mode, Tensor(a!) state, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(rwkv7_wkv_fp32_v2, CUDA, m) {
@@ -163,4 +196,5 @@ TORCH_LIBRARY_IMPL(rwkv7_wkv_fp32_v2, CUDA, m) {
   m.impl("forward_seq", &forward_seq);
   m.impl("forward_small", &forward_small);
   m.impl("forward_block", &forward_block);
+  m.impl("forward_mode", &forward_mode);
 }

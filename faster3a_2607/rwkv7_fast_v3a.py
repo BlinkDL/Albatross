@@ -22,7 +22,11 @@ CUTLASS_INCLUDE_DIR = Path(os.environ.get(
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
 WKV_STATE_LAYOUT = "kv_v2"
+WKV_FP32_PROFILE_MODE = "auto"
+WKV_FP32_PROFILE_ACTIVE = "generic"
 WKV_FP16_POLICY = "tuned"
+WKV_FP16_DEVICE_PROFILE_MODE = "auto"
+WKV_FP16_DEVICE_PROFILE_ACTIVE = "generic"
 WKV_BH_GRID_MODE = "tuned"
 # DeltaLog is opt-in because append phases intentionally keep wkv_state as a
 # physical base. A caller must execute a complete static 0..M-1 cycle before
@@ -135,6 +139,74 @@ FFN_DOWN_GEMM_MODE = "tuned"
 ORIG_DENSE_GEMM_MODE = "tuned"
 ROWS_CUTLASS_MODE = "auto"
 ROWS_CUTLASS_AVAILABLE = False
+GEMM_PROFILE_MODE = "auto"
+GEMM_PROFILE_ACTIVE = "generic"
+CUDA_DEVICE_PROFILE_ACTIVE = "generic"
+
+# Mode IDs are defined by rwkv7_wkv_fp32_v2.cu. These gates are deliberately
+# tied to the 82-SM mobile Blackwell profile: CTA supply and power-limited
+# clocks change the tile/large crossover on other SM120 devices.
+SM120_SM82_WKV_FP32_MODES = {
+    (1, 1): 1,    # large instead of the generic T=1 tile path
+    # Axis gates admitted on the 175 W mobile 5090 by component scans plus
+    # same-process full-model gates in both graph capture orders.
+    (1, 8): 9,
+    # large_occ8 lowers the large kernel from 134 to 128 registers without
+    # spilling. Keep exact gates: shapes with too little CTA supply or long
+    # per-CTA token loops regress even though they use the same kernel body.
+    (8, 8): 9,
+    (8, 16): 9,
+    (16, 8): 9,
+    (8, 32): 9,
+    (32, 8): 9,
+    (16, 16): 9,
+    (16, 32): 9,
+    (32, 16): 9,
+    (8, 64): 9,
+    (16, 64): 9,
+    (64, 16): 9,
+    (32, 32): 9,
+}
+SM120_SM82_WKV_FP32_MODES_BY_C = {
+    768: {
+        **{bt: 1 for bt in (
+            (2, 64), (4, 32), (2, 128), (4, 64), (2, 160),
+            (4, 80), (2, 256), (4, 128), (2, 512), (4, 256),
+        )},
+        (128, 8): 9,
+    },
+    1024: {
+        **{bt: 1 for bt in (
+            (4, 7), (3, 10), (5, 6), (4, 8), (2, 128),
+            (2, 160), (2, 256), (2, 512),
+        )},
+        **{bt: 9 for bt in (
+            (32, 16), (32, 32), (128, 8),
+        )},
+    },
+    2048: {
+        **{bt: 1 for bt in (
+            (1, 32), (1, 64), (1, 128), (1, 256), (1, 320),
+            (1, 512),
+        )},
+        **{bt: 9 for bt in (
+            (16, 16), (64, 4), (16, 20), (64, 5), (16, 32),
+            (64, 8),
+        )},
+        (160, 2): 7,
+    },
+    2560: {
+        **{bt: 1 for bt in (
+            (1, 8), (1, 28), (1, 31), (1, 64), (1, 128),
+            (1, 256), (1, 320), (1, 1024),
+        )},
+        **{bt: 9 for bt in (
+            (64, 2), (64, 4), (16, 20), (32, 10), (40, 8),
+            (16, 64), (64, 16),
+        )},
+    },
+    4096: SM120_SM82_WKV_FP32_MODES,
+}
 ROWS_CUTLASS_UP_4096 = frozenset((128, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192))
 ROWS_CUTLASS_DOWN_4096 = frozenset((128, 192, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192))
 ROWS_CUTLASS_UP_BY_C = {
@@ -427,6 +499,506 @@ ORIG_FFN_KEY_GEMM_BY_C = {
     4096: ORIG_FFN_KEY_GEMM_4096,
 }
 
+# cuBLASLt heuristic indices and the rows-CUTLASS crossover depend on the GPU
+# tile supply. These exact overrides were admitted on the 82-SM RTX 5090
+# Laptop with PyTorch cu132 / CUDA 13.3 by full-weight streams, dual-order E2E, and independent
+# sustained-process gates at +300/0 under the 175W power wall. Several faster
+# isolated strategies were rejected because they lowered the sustained clock.
+# Keep these ahead of generic dispatch, but never apply them to another device.
+# The non-strict Lt entry preserves the existing algo-0 fallback.
+SM120_SM82_ORIG_ATT_C2C_GEMM_4096 = {
+    28: ("gemmex", 0, 0),
+    29: ("gemmex", 0, 0),
+    30: ("gemmex", 0, 0),
+    31: ("gemmex", 0, 0),
+    256: ("lt", 0, 0),
+    257: ("gemmex", 0, 0),
+    272: ("gemmex", 0, 0),
+    280: ("lt", 0, 0),
+    288: ("lt", 32, 0),
+    304: ("gemmex", 0, 0),
+    320: ("lt", 128, 0),
+    384: ("lt", 128, 4),
+    400: ("lt", 32, 0),
+    416: ("lt", 0, 0),
+    448: ("lt", 0, 0),
+    528: ("lt", 0, 0),
+    544: ("lt", 0, 0),
+}
+SM120_SM82_ORIG_FFN_KEY_GEMM_4096 = {
+    **{rows: (0, 2) for rows in range(28, 32)},
+    257: (32, 5),
+    272: (32, 5),
+    280: (32, 5),
+    288: (32, 5),
+    304: (128, 5),
+    320: (32, 5),
+    336: (32, 4),
+    384: (32, 4),
+    400: (128, 4),
+    416: (32, 4),
+    448: (128, 4),
+    528: (32, 5),
+    544: (128, 5),
+}
+SM120_SM82_FFN_DOWN_GEMM_4096 = {
+    **{rows: (32, 1) for rows in range(28, 32)},
+    32: (32, 1),
+    257: (32, 0),
+    272: (0, 0),
+    320: (0, 0),
+    336: (0, 0),
+    352: (0, 0),
+    384: (0, 0),
+    400: (128, 3),
+    416: (32, 3),
+    448: (0, 0),
+    480: (32, 4),
+    496: (128, 4),
+    528: (0, 0),
+    544: (0, 0),
+}
+SM120_SM82_HEAD_LAST_LOGITS_GEMM_4096 = {
+    (256, 1): (32, 5),
+    (257, 1): (128, 2),
+    (272, 1): (128, 5),
+    (280, 1): (128, 4),
+    (288, 1): (0, 2),
+    (304, 1): (32, 5),
+    (320, 1): (32, 4),
+    (336, 1): (0, 4),
+    (384, 1): ("cutlass", 0, 12),
+    (400, 1): (128, 3),
+    (416, 1): (0, 4),
+    (448, 1): (0, 3),
+    (480, 1): ("cutlass", 0, 12),
+    (496, 1): ("cutlass", 0, 12),
+    (512, 1): ("cutlass", 0, 12),
+    (528, 1): (32, 3),
+    (544, 1): (0, 4),
+}
+
+# Exact overrides for the 188-SM RTX PRO 6000 Blackwell workstation. These
+# entries were admitted on GPU1/2/3 at 450 W and fixed 1035/13365 MHz using the
+# all six real model weights across five channel widths, FP16 and FP32IO16, and
+# both graph replay orders with independent recurrent state. The large gains
+# repair cuBLAS heuristic cliffs at B28..31 and B320. Do not widen the row
+# ranges or reuse this table at another SM count without E2E gates.
+SM120_SM188_ORIG_ATT_C2C_GEMM_BY_C = {
+    768: {
+        **{rows: ("gemmex", 0, 0) for rows in range(28, 32)},
+    },
+    1024: {
+        **{rows: ("lt", 32, 3) for rows in range(28, 32)},
+    },
+    2048: {
+        28: ("lt", 32, 2),
+        **{rows: ("lt", 32, 1) for rows in range(29, 32)},
+        320: ("lt", 128, 2),
+    },
+    2560: {
+        320: ("lt", 32, 3),
+    },
+    4096: {
+        **{rows: ("gemmex", 0, 0) for rows in range(28, 32)},
+        # Do not restore the 82-SM Lt128/a0 choice here. On 188 SM it was only
+        # neutral for attention, while the matching 82-SM key/head choices
+        # caused a large full-model regression at B320.
+        320: ("gemmex", 0, 0),
+    },
+}
+SM120_SM188_ORIG_FFN_KEY_GEMM_BY_C = {
+    2048: {320: (0, 0)},
+    2560: {320: (128, 0)},
+    4096: {
+        **{rows: (0, 2) for rows in range(28, 32)},
+        320: (0, 0),
+    },
+}
+SM120_SM188_FFN_DOWN_GEMM_BY_C = {
+    2048: {320: (32, 3)},
+    4096: {
+        **{rows: (32, 1) for rows in range(28, 32)},
+        320: (0, 1),
+    },
+}
+SM120_SM188_HEAD_LAST_LOGITS_GEMM_BY_C = {
+    2048: {(320, 1): (32, 2)},
+    2560: {(320, 1): (128, 3)},
+    4096: {(320, 1): (32, 3)},
+}
+
+# Conservative cross-SM fallback for unrecognized Blackwell GPUs. Integer keys
+# are deliberately row-wide only after every integer B/T factorization passed
+# on both the 82-SM laptop and 188-SM workstation, in FP16 and FP32IO16 and in
+# both graph capture orders. Tuple keys are exact B/T gates and must never leak
+# to another factorization. In particular, C=2560 rows320 key-only wins at five
+# exact shapes, while both the row-wide route and attention+key combinations
+# have large FP16 regressions at several middle factorizations.
+SM120_DEFAULT_ORIG_ATT_C2C_GEMM_4096 = {
+    **{rows: ("gemmex", 0, 0) for rows in range(28, 32)},
+    (257, 1): ("gemmex", 0, 0),
+    (272, 1): ("gemmex", 0, 0),
+    (280, 1): ("lt", 0, 0),
+    (304, 1): ("gemmex", 0, 0),
+    (320, 1): ("lt", 128, 0),
+    (528, 1): ("lt", 0, 0),
+    (544, 1): ("lt", 0, 0),
+}
+SM120_DEFAULT_ORIG_FFN_KEY_GEMM_4096 = {
+    **{rows: (0, 2) for rows in range(28, 32)},
+    (257, 1): (32, 5),
+    (272, 1): (32, 5),
+    (280, 1): (32, 5),
+    (304, 1): (128, 5),
+    (320, 1): (32, 5),
+    (528, 1): (32, 5),
+    (544, 1): (128, 5),
+}
+SM120_DEFAULT_FFN_DOWN_GEMM_4096 = {
+    **{rows: (32, 1) for rows in range(28, 32)},
+    (257, 1): (32, 0),
+    (272, 1): (0, 0),
+    (320, 1): (0, 0),
+    (528, 1): (0, 0),
+    (544, 1): (0, 0),
+}
+SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_4096 = {
+    (257, 1): (128, 2),
+    (272, 1): (128, 5),
+    (280, 1): (128, 4),
+    (304, 1): (32, 5),
+    (320, 1): (32, 4),
+    # This is a small but dual-order positive CUTLASS win on both devices.
+    (512, 1): ("cutlass", 0, 12),
+    (528, 1): (32, 3),
+    (544, 1): (0, 4),
+}
+
+SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C = {
+    768: {
+        # C768 is especially sensitive to B/T factorization under the 175 W
+        # wall. These are the intersection of two independent 82-SM gates;
+        # nearby factors at the same rows flipped and remain generic.
+        **{
+            shape: ("lt", 32, 3)
+            for shape in (
+                (1, 28), (2, 14), (4, 7), (14, 2), (28, 1),
+                (1, 29),
+                (1, 30), (3, 10), (5, 6), (10, 3), (30, 1),
+                (1, 31), (31, 1),
+            )
+        },
+    },
+    1024: {
+        **{rows: ("lt", 32, 3) for rows in range(28, 32)},
+    },
+    2048: {
+        28: ("lt", 32, 2),
+        **{rows: ("lt", 32, 1) for rows in range(29, 32)},
+        320: ("lt", 128, 2),
+    },
+    4096: SM120_DEFAULT_ORIG_ATT_C2C_GEMM_4096,
+}
+SM120_DEFAULT_ORIG_FFN_KEY_GEMM_BY_C = {
+    2048: {320: (0, 0)},
+    2560: {
+        **{
+            shape: (128, 0)
+            for shape in (
+                (1, 320), (2, 160), (4, 80),
+                (160, 2), (320, 1),
+            )
+        },
+    },
+    4096: SM120_DEFAULT_ORIG_FFN_KEY_GEMM_4096,
+}
+SM120_DEFAULT_FFN_DOWN_GEMM_BY_C = {
+    2048: {320: (32, 3)},
+    4096: SM120_DEFAULT_FFN_DOWN_GEMM_4096,
+}
+SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_BY_C = {
+    2048: {(320, 1): (32, 2)},
+    4096: SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_4096,
+}
+
+# Mobile RTX 5090 (82 SM, 175 W) winners for the standard four-axis grid.
+# Row-wide entries passed every tested B/T factorization. Exact entries are
+# intentionally sparse: adjacent factorizations can change CUDA Graph power
+# and clock behavior enough to reverse a small component-only gain.
+SM120_SM82_ORIG_ATT_C2C_GEMM_BY_C = {
+    768: {
+        **SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C.get(768, {}),
+        **{
+            shape: ("gemmex", 0, 0)
+            for shape in ((1, 16), (2, 8), (4, 4))
+        },
+    },
+    1024: {
+        **SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C.get(1024, {}),
+        32: ("lt", 32, 4),
+        **{
+            shape: ("lt", 32, 0)
+            for shape in ((1, 64), (4, 16))
+        },
+        128: ("lt", 128, 4),
+        256: ("lt", 128, 1),
+        **{
+            shape: ("lt", 0, 0)
+            for shape in (
+                (1, 512), (2, 256), (4, 128), (8, 64), (16, 32),
+                (32, 16), (64, 8), (128, 4), (256, 2),
+            )
+        },
+        **{
+            shape: ("gemmex", 0, 0)
+            for shape in ((16, 64), (32, 32), (64, 16))
+        },
+    },
+    2048: {
+        **SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C.get(2048, {}),
+        4: ("lt", 128, 0),
+        8: ("lt", 0, 0),
+        **{
+            shape: ("lt", 0, 0)
+            for shape in ((1, 16), (2, 8), (4, 4), (8, 2))
+        },
+        32: ("lt", 0, 1),
+        **{
+            shape: ("lt", 32, 0)
+            for shape in ((1, 64), (4, 16), (8, 8), (16, 4))
+        },
+        **{
+            shape: ("lt", 32, 0)
+            for shape in ((1, 256), (8, 32), (16, 16), (32, 8))
+        },
+        **{
+            shape: ("lt", 0, 0)
+            for shape in (
+                (1, 512), (2, 256), (4, 128), (8, 64), (16, 32),
+                (32, 16), (64, 8), (128, 4), (256, 2),
+            )
+        },
+        **{
+            shape: ("lt", 32, 5)
+            for shape in ((16, 64), (32, 32), (64, 16))
+        },
+    },
+    2560: {
+        **SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C.get(2560, {}),
+        4: ("lt", 32, 0),
+        8: ("lt", 0, 0),
+        16: ("lt", 32, 0),
+        32: ("gemmex", 0, 0),
+        128: ("lt", 128, 0),
+        256: ("lt", 0, 0),
+        512: ("lt", 0, 0),
+    },
+    4096: SM120_SM82_ORIG_ATT_C2C_GEMM_4096,
+}
+SM120_SM82_ORIG_FFN_KEY_GEMM_BY_C = {
+    768: {
+        **{
+            shape: (32, 1)
+            for shape in ((1, 16), (2, 8), (4, 4))
+        },
+        512: (32, 0),
+        1024: (128, 0),
+    },
+    1024: {
+        **{shape: (32, 1) for shape in ((2, 2), (4, 1))},
+        32: (0, 1),
+        128: (0, 0),
+        256: (32, 0),
+        **{
+            shape: (128, 0)
+            for shape in (
+                (1, 512), (2, 256), (4, 128), (8, 64), (16, 32),
+                (32, 16), (64, 8), (128, 4), (256, 2),
+            )
+        },
+        **{shape: (0, 0) for shape in ((16, 64), (32, 32), (64, 16))},
+    },
+    2048: {
+        **SM120_DEFAULT_ORIG_FFN_KEY_GEMM_BY_C.get(2048, {}),
+        32: (32, 1),
+        **{
+            shape: ("gemmex", 0, 0)
+            for shape in ((1, 64), (4, 16), (8, 8), (16, 4))
+        },
+        (1, 128): (128, 1),
+        **{
+            shape: (32, 5)
+            for shape in ((1, 256), (8, 32), (16, 16), (32, 8))
+        },
+        **{
+            shape: (128, 3)
+            for shape in (
+                (1, 512), (2, 256), (4, 128), (8, 64), (16, 32),
+                (32, 16), (64, 8), (128, 4), (256, 2),
+            )
+        },
+        **{shape: (128, 2) for shape in ((16, 64), (32, 32), (64, 16))},
+    },
+    2560: {
+        **SM120_DEFAULT_ORIG_FFN_KEY_GEMM_BY_C.get(2560, {}),
+        8: (128, 0),
+        16: (32, 1),
+        32: (0, 4),
+        128: (128, 0),
+        512: (0, 0),
+    },
+    4096: SM120_SM82_ORIG_FFN_KEY_GEMM_4096,
+}
+SM120_SM82_FFN_DOWN_GEMM_BY_C = {
+    768: {
+        512: (32, 2),
+        1024: (128, 2),
+    },
+    1024: {
+        32: (32, 7),
+        **{shape: (128, 4) for shape in ((1, 64), (4, 16))},
+        256: (128, 2),
+        **{
+            shape: (128, 2)
+            for shape in (
+                (1, 512), (2, 256), (4, 128), (8, 64), (16, 32),
+                (32, 16), (64, 8), (128, 4), (256, 2),
+            )
+        },
+        **{shape: (128, 1) for shape in ((16, 64), (32, 32), (64, 16))},
+    },
+    2048: {
+        **SM120_DEFAULT_FFN_DOWN_GEMM_BY_C.get(2048, {}),
+        **{
+            shape: (32, 2)
+            for shape in ((1, 16), (2, 8), (4, 4), (8, 2))
+        },
+        32: (128, 2),
+        **{
+            shape: (128, 2)
+            for shape in ((1, 64), (4, 16), (8, 8), (16, 4))
+        },
+    },
+    2560: {
+        32: (32, 1),
+        128: (0, 1),
+        256: (32, 0),
+        512: (0, 0),
+    },
+    4096: SM120_SM82_FFN_DOWN_GEMM_4096,
+}
+SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_B_C = {
+    768: {
+        1: (0, 0), 20: (32, 1), 29: (0, 2), 30: (0, 0),
+        31: (128, 1), 32: (128, 1), 80: (0, 0), 320: (0, 0),
+    },
+    1024: {
+        1: ("gemmex", 0, 0), 28: (0, 1), 29: (32, 1), 30: (128, 1),
+        31: (128, 1), 32: (0, 1), 256: (0, 0),
+        512: ("gemmex", 0, 0),
+    },
+    2048: {
+        1: ("gemmex", 0, 0), 2: (128, 0), 28: (0, 2), 29: (0, 2),
+        30: (0, 2), 31: (0, 2), 160: (128, 1), 256: (32, 0),
+        320: (0, 1), 512: (0, 1),
+    },
+    2560: {
+        1: (0, 3), 2: (0, 3), 20: (0, 2), 28: (0, 2), 29: (0, 2),
+        30: (0, 2), 31: (0, 2), 32: (0, 2), 64: (32, 3),
+        80: (128, 0), 128: (128, 1), 160: (32, 3), 256: (32, 1),
+        320: (32, 0), 512: (0, 1), 1024: (32, 4),
+    },
+}
+SM120_SM82_HEAD_LAST_LOGITS_ACCEPTED_BT_BY_C = {
+    # Exact-shape allowlist after both the isolated dense gate and the final
+    # combined dense+WKV gate. Do not widen these entries by row count.
+    768: (
+        (1, 16), (1, 512), (1, 1024),
+        (32, 16), (32, 32), (80, 4), (320, 1),
+    ),
+    1024: (
+        (1, 8), (1, 30), (1, 31), (1, 32), (1, 64), (1, 128),
+        (1, 256), (1, 512), (32, 4), (32, 8),
+        (32, 16), (32, 32), (256, 1), (256, 2), (512, 1), (512, 2),
+    ),
+    2048: (
+        (1, 4), (1, 8), (1, 16), (1, 32), (1, 64), (1, 128),
+        (1, 256), (1, 512), (2, 2), (2, 4), (2, 8), (2, 16),
+        (2, 128), (2, 160), (2, 256),
+    ),
+    2560: (
+        (1, 4), (1, 8), (1, 16), (1, 32), (1, 128), (1, 256),
+        (1, 512), (2, 2), (2, 4), (2, 8), (2, 16), (2, 64),
+        (2, 128), (2, 256), (32, 1), (32, 4), (32, 8), (32, 10),
+        (32, 16), (64, 2), (64, 4), (64, 8), (80, 4), (128, 1),
+        (128, 2), (128, 4), (256, 1), (256, 2), (512, 1), (512, 2),
+    ),
+}
+# C2560 B512T2 is +0.470% in the dual-order FP16 gate. FP32IO16 cannot keep
+# both 24 GB graphs resident and has no matching sequential dense gate, so it
+# must fall back instead of inheriting the shared head table without evidence.
+SM120_SM82_HEAD_LAST_LOGITS_FP16_ONLY_BT_BY_C = {
+    2560: frozenset(((512, 2),)),
+}
+SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_C = {
+    **{
+        channels: {
+            **SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_BY_C.get(channels, {}),
+            **{
+                bt: SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_B_C[channels][bt[0]]
+                for bt in SM120_SM82_HEAD_LAST_LOGITS_ACCEPTED_BT_BY_C[channels]
+            },
+        }
+        for channels in (768, 1024, 2048, 2560)
+    },
+    4096: SM120_SM82_HEAD_LAST_LOGITS_GEMM_4096,
+}
+
+SM120_GEMM_PROFILE_TABLES = {
+    **{
+        ("sm120-default", channels): (
+            SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C.get(channels, {}),
+            SM120_DEFAULT_ORIG_FFN_KEY_GEMM_BY_C.get(channels, {}),
+            SM120_DEFAULT_FFN_DOWN_GEMM_BY_C.get(channels, {}),
+            SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_BY_C.get(channels, {}),
+        )
+        for channels in (768, 1024, 2048, 2560, 4096)
+    },
+    **{
+        ("sm120-sm82", channels): (
+            SM120_SM82_ORIG_ATT_C2C_GEMM_BY_C.get(channels, {}),
+            SM120_SM82_ORIG_FFN_KEY_GEMM_BY_C.get(channels, {}),
+            SM120_SM82_FFN_DOWN_GEMM_BY_C.get(channels, {}),
+            SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_C.get(channels, {}),
+        )
+        for channels in (768, 1024, 2048, 2560, 4096)
+    },
+    **{
+        ("sm120-sm188", channels): (
+            SM120_SM188_ORIG_ATT_C2C_GEMM_BY_C.get(channels, {}),
+            SM120_SM188_ORIG_FFN_KEY_GEMM_BY_C.get(channels, {}),
+            SM120_SM188_FFN_DOWN_GEMM_BY_C.get(channels, {}),
+            SM120_SM188_HEAD_LAST_LOGITS_GEMM_BY_C.get(channels, {}),
+        )
+        for channels in (768, 1024, 2048, 2560, 4096)
+    },
+}
+
+
+def gemm_profile_config(table: dict, x: torch.Tensor, rows: int):
+    # Exact B/T ownership must win before the row-wide fallback.  Reversing
+    # this order can silently apply a BnT1-only Lt algorithm to B1Tn/BnTn.
+    if x.dim() >= 3:
+        config = table.get((int(x.size(0)), int(x.size(1))))
+        if config is not None:
+            return config
+    return table.get(rows)
+
+# Do not interpolate the sparse high-row entries. B368 down+head regressed in
+# both capture orders. At B496 the isolated attention/key candidates regressed
+# E2E by 3-6% under the 175W wall, while down+head gained 2.2-2.5% together.
+
 # Exact B/T overrides admitted on the C=4096,H=64 model only. Keep this sparse:
 # WKV task supply depends on B*H while the recurrent critical path depends on T,
 # so neither a rows-only threshold nor cross-model reuse is justified.
@@ -481,6 +1053,100 @@ WKV_FP16_PATH_OVERRIDES_BY_C = {
         (32, 1): ("fused", "auto", "2d"),
     },
 }
+
+# These schedules trade register-resident state for a different KV owner map.
+# They are bitwise identical to the prior T1 path at the admitted shapes, but
+# their E2E gain depends on the 82-SM CTA supply and 175 W clock response.
+SM120_SM82_WKV_FP16_PATH_OVERRIDES_4096 = {
+    (64, 1): ("fused", "spill48", "flat"),
+    (128, 1): ("fused", "vector", "2d"),
+}
+
+# Candidate schedules for the 82-SM mobile Blackwell.  Each key is exact:
+# direct kernels keep one recurrent state owner per (B,H), so B determines CTA
+# supply while T determines serial work and neither axis may be interpolated.
+# Entries remain here only after component scans, dual-order full-model gates,
+# and the final combined dense+WKV gate. Do not interpolate adjacent B/T pairs.
+SM120_SM82_WKV_FP16_PATH_OVERRIDES_BY_C = {
+    768: {
+        (256, 1): ("fused", "spill48", "flat"),
+        (5, 64): ("fused", "staged", "2d"),
+        (10, 32): ("fused", "staged", "2d"),
+        (320, 1): ("fused", "warp", "flat"),
+        (16, 32): ("fused", "seq", "2d"),
+        (64, 8): ("fused", "warp", "flat"),
+        (512, 1): ("fused", "spill32", "flat"),
+        (32, 32): ("fused", "exact", "flat"),
+        (64, 16): ("fused", "warp", "flat"),
+        (1024, 1): ("fused", "vector", "2d"),
+    },
+    1024: {
+        (1, 30): ("fused", "staged", "2d"),
+        (1, 31): ("fused", "staged", "2d"),
+        (4, 64): ("fused", "staged", "2d"),
+        (32, 8): ("fused", "warp", "flat"),
+        (256, 1): ("fused", "spill48", "flat"),
+        (8, 40): ("fused", "seq", "flat"),
+        (32, 10): ("fused", "warp", "flat"),
+        (320, 1): ("fused", "warp", "flat"),
+        (8, 64): ("fused", "auto", "2d"),
+        (16, 32): ("fused", "vector", "2d"),
+        (512, 1): ("fused", "vector", "2d"),
+        (16, 64): ("fused", "auto", "flat"),
+        (32, 32): ("fused", "warp", "flat"),
+        (64, 16): ("fused", "warp", "flat"),
+        (512, 2): ("fused", "vector_flat", "flat"),
+        (1024, 1): ("fused", "vector", "2d"),
+    },
+    2048: {
+        (2, 64): ("fused", "staged", "2d"),
+        (128, 1): ("fused", "spill48", "flat"),
+        (32, 8): ("fused", "warp", "flat"),
+        (256, 1): ("fused", "vector", "2d"),
+        (5, 64): ("fused", "seq", "2d"),
+        (10, 32): ("fused", "seq", "2d"),
+        (16, 20): ("fused", "warp", "flat"),
+        (20, 16): ("fused", "warp", "flat"),
+        (32, 10): ("fused", "warp", "flat"),
+        (320, 1): ("fused", "vector", "2d"),
+        (4, 128): ("fused", "auto", "flat"),
+        (8, 64): ("fused", "auto", "flat"),
+        (16, 32): ("fused", "warp", "flat"),
+    },
+    2560: {
+        (2, 14): ("fused", "staged", "2d"),
+        (29, 1): ("fused", "auto", "2d"),
+        (2, 64): ("fused", "staged", "2d"),
+        (128, 1): ("fused", "spill48", "flat"),
+        (256, 1): ("fused", "vector", "2d"),
+        (2, 160): ("fused", "staged", "2d"),
+        (5, 64): ("fused", "staged", "2d"),
+        (8, 40): ("fused", "exact", "2d"),
+        (10, 32): ("fused", "auto", "flat"),
+        (16, 20): ("fused", "warp", "flat"),
+        (20, 16): ("fused", "warp", "flat"),
+        (320, 1): ("fused", "warp", "flat"),
+        (4, 256): ("fused", "staged", "2d"),
+        (8, 128): ("fused", "exact", "flat"),
+        (16, 64): ("fused", "warp", "flat"),
+        (32, 32): ("fused", "auto", "flat"),
+    },
+    4096: SM120_SM82_WKV_FP16_PATH_OVERRIDES_4096,
+}
+
+
+def sm120_sm82_wkv_fp16_t1_range_override(B: int, T: int):
+    if T != 1:
+        return None
+    # These deliberately have gaps. Full-model dual-capture gates flipped at
+    # B36, B88/B92, and several B100..112 points under the 175 W power wall.
+    if 28 <= B <= 32 or 40 <= B <= 84:
+        return "fused", "spill48", "flat"
+    if 116 <= B <= 127:
+        return "fused", "warp", "2d"
+    if 129 <= B <= 208:
+        return "fused", "vector", "2d"
+    return None
 
 # Tuned table for the 4096-wide 7B model, admitted by real B/T E2E and eval_src2
 # on 2026-07-14. cuBLASLt heuristic indices are CUDA/GPU specific; production
@@ -551,7 +1217,7 @@ LOWRANK_OUT_GEMM_4096 = {
 }
 
 def main() -> None:
-    global MODEL_PATH, WKV_MODE, WKV_FP16_POLICY, WKV_BH_GRID_MODE, ADD_VEC_MODE, LAST_LN_MODE, LNX_MODE, LN_OWNER_MODE, LN_STATS_MODE, CMIX_LN_STATS_MODE, CMIX_MIX_MODE, CMIX_VALUE_LOOP_MODE, CMIX_T512_ACCUM_MODE, CMIX_T512_REUSE_MODE, TMIX_MIX_MODE, HEAD_GRID_MODE, HEAD_ALL_LOGITS_GEMM_MODE, HEAD_LAST_LOGITS_GEMM_MODE, FFN_DOWN_GEMM_MODE, ORIG_DENSE_GEMM_MODE, ROWS_CUTLASS_MODE, VRES_GATE_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, LOWRANK_GEMM_MODE, ORIG_LINEAR_GROUPS, PP_DEVICES
+    global MODEL_PATH, WKV_MODE, WKV_FP32_PROFILE_MODE, WKV_FP16_POLICY, WKV_FP16_DEVICE_PROFILE_MODE, WKV_BH_GRID_MODE, ADD_VEC_MODE, LAST_LN_MODE, LNX_MODE, LN_OWNER_MODE, LN_STATS_MODE, CMIX_LN_STATS_MODE, CMIX_MIX_MODE, CMIX_VALUE_LOOP_MODE, CMIX_T512_ACCUM_MODE, CMIX_T512_REUSE_MODE, TMIX_MIX_MODE, HEAD_GRID_MODE, HEAD_ALL_LOGITS_GEMM_MODE, HEAD_LAST_LOGITS_GEMM_MODE, FFN_DOWN_GEMM_MODE, ORIG_DENSE_GEMM_MODE, ROWS_CUTLASS_MODE, GEMM_PROFILE_MODE, VRES_GATE_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, LOWRANK_GEMM_MODE, ORIG_LINEAR_GROUPS, PP_DEVICES
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--warmup", type=int, default=1)
@@ -566,9 +1232,17 @@ def main() -> None:
     parser.add_argument("--eval-paths", default="b1tn")
     parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp32io16 is more accurate
     parser.add_argument(
+        "--wkv-fp32-profile",
+        choices=("auto", "generic", "sm120-sm82"),
+        default=WKV_FP32_PROFILE_MODE)
+    parser.add_argument(
         "--deltalog", action="store_true",
         help="use the fastest strictly gated DeltaLog path for FP16 BnT1")
     parser.add_argument("--wkv-fp16-policy", choices=("current", "tuned"), default=WKV_FP16_POLICY)
+    parser.add_argument(
+        "--wkv-fp16-device-profile",
+        choices=("auto", "generic", "sm120-sm82"),
+        default=WKV_FP16_DEVICE_PROFILE_MODE)
     parser.add_argument("--wkv-bh-grid", choices=("current", "tuned"), default=WKV_BH_GRID_MODE)
     parser.add_argument("--add-vec", choices=("current", "tuned"), default=ADD_VEC_MODE)
     parser.add_argument("--last-ln", choices=("current", "indexed"), default=LAST_LN_MODE)
@@ -609,6 +1283,10 @@ def main() -> None:
     parser.add_argument(
         "--rows-cutlass", choices=("auto", "off", "tuned"),
         default=ROWS_CUTLASS_MODE)
+    parser.add_argument(
+        "--gemm-profile",
+        choices=("auto", "generic", "sm120-default", "sm120-sm82", "sm120-sm188"),
+        default=GEMM_PROFILE_MODE)
     parser.add_argument("--vres-gate", choices=("current", "tuned"), default=VRES_GATE_MODE)
     parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
     parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off") # auto is slightly faster but consumes lots of VRAM
@@ -621,7 +1299,9 @@ def main() -> None:
 
     MODEL_PATH = args.model
     WKV_MODE = args.wkv
+    WKV_FP32_PROFILE_MODE = args.wkv_fp32_profile
     WKV_FP16_POLICY = args.wkv_fp16_policy
+    WKV_FP16_DEVICE_PROFILE_MODE = args.wkv_fp16_device_profile
     WKV_BH_GRID_MODE = args.wkv_bh_grid
     ADD_VEC_MODE = args.add_vec
     LAST_LN_MODE = args.last_ln
@@ -640,6 +1320,7 @@ def main() -> None:
     FFN_DOWN_GEMM_MODE = args.ffn_down_gemm
     ORIG_DENSE_GEMM_MODE = args.orig_dense_gemm
     ROWS_CUTLASS_MODE = args.rows_cutlass
+    GEMM_PROFILE_MODE = args.gemm_profile
     VRES_GATE_MODE = args.vres_gate
     EMB_DEVICE = args.emb
     RKV_MODE = args.batched_rkv
@@ -656,7 +1337,7 @@ def main() -> None:
         parser.error("--deltalog is BnT1-only; the CLI eval paths use B1 and are not tuned")
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_state_layout={WKV_STATE_LAYOUT} deltalog={'on' if args.deltalog else 'off'} wkv_fp16_policy={WKV_FP16_POLICY} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} wkv_state_layout={WKV_STATE_LAYOUT} wkv_fp32_profile={WKV_FP32_PROFILE_MODE} deltalog={'on' if args.deltalog else 'off'} wkv_fp16_policy={WKV_FP16_POLICY} wkv_fp16_device_profile={WKV_FP16_DEVICE_PROFILE_MODE} wkv_bh_grid={WKV_BH_GRID_MODE} add_vec={ADD_VEC_MODE} last_ln={LAST_LN_MODE} lnx={LNX_MODE} ln_owner={LN_OWNER_MODE} ln_stats={LN_STATS_MODE} cmix_ln_stats={CMIX_LN_STATS_MODE} cmix_mix={CMIX_MIX_MODE} cmix_value_loop={CMIX_VALUE_LOOP_MODE} cmix_t512_accum={CMIX_T512_ACCUM_MODE} cmix_t512_reuse={CMIX_T512_REUSE_MODE} tmix_mix={TMIX_MIX_MODE} head_grid={HEAD_GRID_MODE} head_all_logits_gemm={HEAD_ALL_LOGITS_GEMM_MODE} head_last_logits_gemm={HEAD_LAST_LOGITS_GEMM_MODE} ffn_down_gemm={FFN_DOWN_GEMM_MODE} orig_dense_gemm={ORIG_DENSE_GEMM_MODE} rows_cutlass={ROWS_CUTLASS_MODE} gemm_profile={GEMM_PROFILE_MODE} vres_gate={VRES_GATE_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} lowrank_gemm={LOWRANK_GEMM_MODE} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS} t512_acc2=exact_BT t512_reuse=exact_BT")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -712,6 +1393,15 @@ def use_wkv_bh_grid_2d(B: int, T: int, C: int, H: int) -> bool:
 def wkv_fp16_path_override(B: int, T: int, C: int, H: int):
     if WKV_FP16_POLICY != "tuned" or C != H * 64:
         return None
+    if WKV_FP16_DEVICE_PROFILE_ACTIVE == "sm120-sm82":
+        device_override = SM120_SM82_WKV_FP16_PATH_OVERRIDES_BY_C.get(C, {}).get((B, T))
+        if device_override is not None:
+            return device_override
+        range_override = (
+            sm120_sm82_wkv_fp16_t1_range_override(B, T)
+            if C == 4096 else None)
+        if range_override is not None:
+            return range_override
     return WKV_FP16_PATH_OVERRIDES_BY_C.get(C, {}).get((B, T))
 
 
@@ -887,6 +1577,66 @@ def tuned_vres_gate_threads(rows: int, channels: int) -> int | None:
 
 def log(message: str) -> None:
     print(f"[rwkv7_fast_v3a] {message}", flush=True)
+
+def select_gemm_profile() -> None:
+    global CUDA_DEVICE_PROFILE_ACTIVE, GEMM_PROFILE_ACTIVE, WKV_FP32_PROFILE_ACTIVE, WKV_FP16_DEVICE_PROFILE_ACTIVE
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    detected_profile = "generic"
+    if properties.major == 12:
+        if ("sm120-default", C) in SM120_GEMM_PROFILE_TABLES:
+            detected_profile = "sm120-default"
+        if (
+            properties.minor == 0
+            and properties.multi_processor_count == 82
+            and ("sm120-sm82", C) in SM120_GEMM_PROFILE_TABLES
+        ):
+            detected_profile = "sm120-sm82"
+        elif (
+            properties.minor == 0
+            and properties.multi_processor_count == 188
+            and ("sm120-sm188", C) in SM120_GEMM_PROFILE_TABLES
+        ):
+            detected_profile = "sm120-sm188"
+    CUDA_DEVICE_PROFILE_ACTIVE = detected_profile
+    if GEMM_PROFILE_MODE == "auto":
+        GEMM_PROFILE_ACTIVE = detected_profile
+    else:
+        GEMM_PROFILE_ACTIVE = GEMM_PROFILE_MODE
+    if WKV_FP32_PROFILE_MODE == "auto":
+        # The 188-SM profile currently owns GEMM only. Its WKV schedules have
+        # not passed the 82-SM profile's exact-shape correctness/E2E gates.
+        WKV_FP32_PROFILE_ACTIVE = (
+            "sm120-sm82"
+            if detected_profile == "sm120-sm82"
+            and C in SM120_SM82_WKV_FP32_MODES_BY_C
+            else "generic")
+    else:
+        WKV_FP32_PROFILE_ACTIVE = WKV_FP32_PROFILE_MODE
+    if WKV_FP16_DEVICE_PROFILE_MODE == "auto":
+        WKV_FP16_DEVICE_PROFILE_ACTIVE = (
+            "sm120-sm82"
+            if detected_profile == "sm120-sm82"
+            and C in SM120_SM82_WKV_FP16_PATH_OVERRIDES_BY_C
+            else "generic")
+    else:
+        WKV_FP16_DEVICE_PROFILE_ACTIVE = WKV_FP16_DEVICE_PROFILE_MODE
+    log(
+        f"GEMM profile active={GEMM_PROFILE_ACTIVE} mode={GEMM_PROFILE_MODE} "
+        f"device_profile={CUDA_DEVICE_PROFILE_ACTIVE} "
+        f"gpu={properties.name} cc={properties.major}.{properties.minor} "
+        f"sm={properties.multi_processor_count}")
+    log(
+        f"WKV FP32 profile active={WKV_FP32_PROFILE_ACTIVE} "
+        f"mode={WKV_FP32_PROFILE_MODE}")
+    log(
+        f"WKV FP16 device profile active={WKV_FP16_DEVICE_PROFILE_ACTIVE} "
+        f"mode={WKV_FP16_DEVICE_PROFILE_MODE}")
+
+
+def wkv_fp32_mode(batch: int, tokens: int) -> int:
+    if WKV_FP32_PROFILE_ACTIVE == "sm120-sm82":
+        return SM120_SM82_WKV_FP32_MODES_BY_C.get(C, {}).get((batch, tokens), 0)
+    return 0
 
 def cuda_mem() -> str:
     if not torch.cuda.is_available():
@@ -1115,6 +1865,7 @@ class RWKV7:
         max_layer = max(int(k.split(".")[1]) for k in z.keys() if k.startswith("blocks."))
         L = max_layer + 1
         log(f"detected model C={C} H={H} N={N} V={V}")
+        select_gemm_profile()
         load_rows_cutlass_extension()
         log(f"cmix no-fc path: rows<={cmix_nofc_max_rows()} row20_t<={cmix_nofc_row20_max_t()}")
 
@@ -1749,13 +2500,49 @@ class RWKV7:
                     wkv_state, *log_workspace, *factor_args)
         elif WKV_MODE == "fp32io16":
             w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
-            torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
+            mode = wkv_fp32_mode(B, T)
+            if mode:
+                torch.ops.rwkv7_wkv_fp32_v2.forward_mode(B, T, C, H, mode, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
+            else:
+                torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
         elif (wkv_override := wkv_fp16_path_override(B, T, C, H)) is not None:
             w0_mode, kernel_mode, grid_mode = wkv_override
             grid2d = grid_mode == "2d"
             forced_mode = 0 if kernel_mode == "exact" else 1
             if w0_mode == "fused":
-                if kernel_mode == "auto":
+                # These direct KV entries have different thread ownership and
+                # must remain behind exact B/T/device gates. One CTA owns the
+                # complete (B,H) state and advances T serially; broadening a
+                # gate by rows alone can change both occupancy and recurrence.
+                if kernel_mode.startswith("spill"):
+                    keep_keys = int(kernel_mode.removeprefix("spill"))
+                    if keep_keys not in (16, 32, 48):
+                        raise RuntimeError(f"unsupported spill key count: {keep_keys}")
+                    torch.ops.rwkv7_wkv_fp16_v2.wkv_kv_warp_spill_w0(
+                        B, T, C, H, keep_keys, wkv_state, r.contiguous(), w.contiguous(),
+                        z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(),
+                        kka.contiguous(), y, elapsed_t)
+                elif kernel_mode == "warp":
+                    torch.ops.rwkv7_wkv_fp16_v2.wkv_kv_warp_w0(
+                        B, T, C, H, wkv_state, r.contiguous(), w.contiguous(),
+                        z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(),
+                        kka.contiguous(), y, elapsed_t)
+                elif kernel_mode == "vector":
+                    torch.ops.rwkv7_wkv_fp16_v2.wkv_kv_vector_w0(
+                        B, T, C, H, wkv_state, r.contiguous(), w.contiguous(),
+                        z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(),
+                        kka.contiguous(), y, elapsed_t)
+                elif kernel_mode == "vector_flat":
+                    torch.ops.rwkv7_wkv_fp16_v2.wkv_kv_vector_flat_w0(
+                        B, T, C, H, wkv_state, r.contiguous(), w.contiguous(),
+                        z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(),
+                        kka.contiguous(), y, elapsed_t)
+                elif kernel_mode == "staged":
+                    torch.ops.rwkv7_wkv_fp16_v2.wkv_kv_staged_w0(
+                        B, T, C, H, wkv_state, r.contiguous(), w.contiguous(),
+                        z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(),
+                        kka.contiguous(), y, elapsed_t)
+                elif kernel_mode == "auto":
                     # T=1 must use auto: forced WKV APIs deliberately reject it.
                     wkv_op = (
                         torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_grid2d
@@ -1764,6 +2551,8 @@ class RWKV7:
                         B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"],
                         k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
                 else:
+                    if kernel_mode not in ("exact", "seq"):
+                        raise RuntimeError(f"unsupported fused WKV mode: {kernel_mode}")
                     wkv_op = (
                         torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_grid2d_forced
                         if grid2d else torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_forced)
@@ -1854,6 +2643,16 @@ class RWKV7:
         return self.linear_ffn_down(k, z[p+"value.weight"], path.rows)
 
     def linear_ffn_down(self, x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
+        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        if profile_tables is not None and tuple(weight.shape) == (4 * C, C):
+            # Lt indices are tied to the exact GPU profile selected at model load.
+            # Keep the non-strict call so CUDA/driver heuristic changes fall
+            # back to algo 0 instead of turning an optional tuning into failure.
+            profile_cfg = gemm_profile_config(profile_tables[2], x, rows)
+            if profile_cfg is not None:
+                workspace_mb, algo_index = profile_cfg
+                return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                    x.contiguous(), weight, workspace_mb, algo_index)
         if (
             ROWS_CUTLASS_AVAILABLE
             and rows in ROWS_CUTLASS_DOWN_BY_C.get(C, ())
@@ -1895,6 +2694,39 @@ class RWKV7:
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
+        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        if profile_tables is not None and tuple(z["head.weight"].shape) == (V, C):
+            # The head GEMM has B rows while the body has B*T rows. Keep the
+            # exact (B,T) gate: adjacent T values flipped in dual-order E2E.
+            profile_cfg = profile_tables[3].get((rows, tokens_count))
+            if (
+                GEMM_PROFILE_ACTIVE == "sm120-sm82"
+                and WKV_MODE == "fp32io16"
+                and (rows, tokens_count)
+                in SM120_SM82_HEAD_LAST_LOGITS_FP16_ONLY_BT_BY_C.get(C, ())
+            ):
+                profile_cfg = None
+            if profile_cfg is not None:
+                # Do not turn these into ranges. On the 175W laptop, several
+                # component-fast high-row GEMMs lowered the sustained clock and
+                # regressed E2E by 5-7% at adjacent B480/B512.
+                if len(profile_cfg) == 2:
+                    kind = "lt"
+                    workspace_mb, algo_index = profile_cfg
+                else:
+                    kind, workspace_mb, algo_index = profile_cfg
+                if kind == "cutlass" and ROWS_CUTLASS_AVAILABLE:
+                    return torch.ops.rwkv7_rows_cutlass.linear_orig(
+                        x.contiguous(), z["head.weight"], algo_index)
+                if kind == "gemmex":
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
+                        x.contiguous(), z["head.weight"])
+                if kind != "lt":
+                    return self.linear_orig_layout(
+                        x, z["head.weight"],
+                        PathConfig(rows, False, CMIX_DENSE), "head")
+                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
+                    x.contiguous(), z["head.weight"], workspace_mb, algo_index)
         if (
             HEAD_LAST_LOGITS_GEMM_MODE == "tuned"
             and tuple(z["head.weight"].shape) == (V, C)
@@ -1911,6 +2743,43 @@ class RWKV7:
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
         if not use_orig_linear(group):
             return self.linear(x, weight)
+        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        if profile_tables is not None:
+            if group == "att_c2c" and tuple(weight.shape) == (C, C):
+                profile_cfg = gemm_profile_config(profile_tables[0], x, path.rows)
+            elif group == "ffn_key" and tuple(weight.shape) == (4 * C, C):
+                profile_cfg = gemm_profile_config(profile_tables[1], x, path.rows)
+            else:
+                profile_cfg = None
+            # FP32IO16 B288 is the 24 GiB boundary.  The FP16 winners reserve
+            # another 32 MiB for both attention and key.  Keep both GEMMs on
+            # their existing generic paths here: replacing the 128 MiB key by
+            # a zero-workspace candidate saved memory but had no stable E2E
+            # speed gain.  FP16 retains its faster profile.
+            if WKV_MODE == "fp32io16" and path.rows == 288:
+                if group in ("att_c2c", "ffn_key"):
+                    profile_cfg = None
+            if profile_cfg is not None:
+                if group == "att_c2c":
+                    if len(profile_cfg) == 2:
+                        kind = "lt"
+                        workspace_mb, algo_index = profile_cfg
+                    else:
+                        kind, workspace_mb, algo_index = profile_cfg
+                    if kind == "gemmex":
+                        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
+                            x.contiguous(), weight)
+                else:
+                    if len(profile_cfg) == 2:
+                        kind = "lt"
+                        workspace_mb, algo_index = profile_cfg
+                    else:
+                        kind, workspace_mb, algo_index = profile_cfg
+                    if kind == "gemmex":
+                        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
+                            x.contiguous(), weight)
+                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
+                    x.contiguous(), weight, workspace_mb, algo_index)
         if (
             ROWS_CUTLASS_AVAILABLE
             and path.rows in ROWS_CUTLASS_C2C_BY_C.get(C, ())

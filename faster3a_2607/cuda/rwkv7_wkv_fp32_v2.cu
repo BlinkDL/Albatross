@@ -23,7 +23,8 @@ __device__ __forceinline__ float retention(float w) {
 
 // Physical state ABI is [B,H,K,V]. Lane v owns one V column and keeps all K
 // values in registers. Adjacent lanes therefore issue contiguous state loads.
-__global__ __launch_bounds__(kHeadSize, 2) void wkv_kv_large_kernel(
+template <int MinBlocksPerSm>
+__global__ __launch_bounds__(kHeadSize, MinBlocksPerSm) void wkv_kv_large_kernel(
     int T,
     int C,
     int H,
@@ -59,7 +60,12 @@ __global__ __launch_bounds__(kHeadSize, 2) void wkv_kv_large_kernel(
 
   for (int token = 0; token < T; ++token) {
     const int64_t index = token_base + static_cast<int64_t>(token) * C + value_index;
-    __syncthreads();
+    // Tokens after the first must wait until both warps consumed the previous
+    // shared vectors. Before token 0 there is no consumer, so that barrier is
+    // pure warp-gap and can be skipped safely.
+    if (token != 0) {
+      __syncthreads();
+    }
     r[value_index] = load_half(r_ptr, index);
     decay[value_index] = retention(load_half(w_ptr, index));
     k[value_index] = load_half(k_ptr, index);
@@ -444,6 +450,11 @@ void WKV_LAYOUT_ENTRY(
     }
     return;
   }
-  wkv_kv_large_kernel<<<B * H, kHeadSize, 0, stream>>>(
-      T, C, H, state_ptr, r_ptr, w_ptr, k_ptr, v_ptr, a_ptr, b_ptr, y_ptr);
+  if (mode == 9) {
+    wkv_kv_large_kernel<8><<<B * H, kHeadSize, 0, stream>>>(
+        T, C, H, state_ptr, r_ptr, w_ptr, k_ptr, v_ptr, a_ptr, b_ptr, y_ptr);
+  } else {
+    wkv_kv_large_kernel<2><<<B * H, kHeadSize, 0, stream>>>(
+        T, C, H, state_ptr, r_ptr, w_ptr, k_ptr, v_ptr, a_ptr, b_ptr, y_ptr);
+  }
 }
