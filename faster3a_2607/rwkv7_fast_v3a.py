@@ -955,6 +955,280 @@ SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_C = {
     4096: SM120_SM82_HEAD_LAST_LOGITS_GEMM_4096,
 }
 
+# RTX 5090 FE (170 SM) admission sets. Every shape below was positive in both
+# graph capture orders and in all ten paired 8-iteration rounds at requested
+# 1500 MHz / 450 W. Keep FP16 and FP32IO16 separate: a few otherwise identical
+# dense routes cross zero when recurrent-state precision changes graph power.
+def _factorizations(rows: int, batches: tuple[int, ...]) -> frozenset[tuple[int, int]]:
+    return frozenset((batch, rows // batch) for batch in batches)
+
+
+_SM170_C768_SM82 = (
+    _factorizations(16, (1, 2, 4))
+    | _factorizations(1024, (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024))
+)
+_SM170_C768_SM188 = frozenset(((7, 4), (29, 1), (2, 15), (6, 5), (15, 2)))
+_SM170_C1024_COMMON = (
+    frozenset(((1, 64), (4, 16)))
+    | _factorizations(128, (1, 2, 4, 8, 16, 32, 64, 128))
+    | _factorizations(256, (1, 2, 4, 8, 16, 32, 64, 128, 256))
+    | _factorizations(512, (1, 2, 4, 8, 16, 32, 64, 128, 256))
+)
+_SM170_C2048_COMMON = (
+    _factorizations(8, (1, 2, 4, 8))
+    | _factorizations(64, (1, 4, 8, 16))
+    | frozenset(((1, 128),))
+    | _factorizations(256, (1, 8, 16, 32))
+    | _factorizations(512, (1, 2, 4, 8, 16, 32, 64, 128, 256))
+)
+_SM170_C2560_COMMON = (
+    _factorizations(256, (1, 2, 4, 8, 16, 32, 64, 128, 256))
+    | _factorizations(512, (1, 2, 4, 8, 16, 32, 64, 128, 256, 512))
+)
+_SM170_C2560_SM188 = _factorizations(
+    320, (1, 2, 4, 5, 8, 10, 16, 20, 32, 40, 64, 80, 160, 320))
+
+SM120_SM170_DENSE_ACCEPTED_BT = {
+    ("sm82", "fp16", 768): _SM170_C768_SM82,
+    ("sm82", "fp32io16", 768): _SM170_C768_SM82,
+    ("sm188", "fp16", 768): _SM170_C768_SM188,
+    ("sm188", "fp32io16", 768): _SM170_C768_SM188,
+    ("sm82", "fp16", 1024): _SM170_C1024_COMMON,
+    ("sm82", "fp32io16", 1024): _SM170_C1024_COMMON - {(128, 2)},
+    ("sm82", "fp16", 2048): _SM170_C2048_COMMON | {(1, 32)},
+    ("sm82", "fp32io16", 2048): _SM170_C2048_COMMON,
+    ("sm82", "fp16", 2560): _SM170_C2560_COMMON | {(64, 2)},
+    ("sm82", "fp32io16", 2560): _SM170_C2560_COMMON,
+    ("sm188", "fp16", 2560): _SM170_C2560_SM188,
+    ("sm188", "fp32io16", 2560): _SM170_C2560_SM188,
+}
+
+
+def _bnt1(*batches: int) -> frozenset[tuple[int, int]]:
+    return frozenset((batch, 1) for batch in batches)
+
+
+# Native 170-SM dense routes found with one-real-weight algorithm screening,
+# then admitted only by real-model dual-order 8x5 gates. Configuration tuple
+# order is attention, FFN key, FFN down, last logits; None keeps the current
+# route for that group. These are exact BnT1 entries: never widen them by rows.
+SM120_SM170_NATIVE_DENSE_CONFIGS_BY_C = {
+    768: {
+        (16, 1): (("lt", 32, 0), (0, 0), (128, 1), (0, 5)),
+        (24, 1): (("lt", 0, 0), None, (32, 3), (128, 2)),
+        (30, 1): (("gemmex", 0, 0), None, (128, 6), (32, 2)),
+        (31, 1): (("lt", 0, 0), None, (32, 6), (32, 2)),
+        (32, 1): (None, None, (32, 3), (0, 2)),
+        (48, 1): (("gemmex", 0, 0), (128, 3), None, None),
+        (64, 1): (("lt", 32, 1), None, (128, 3), None),
+        (96, 1): (("gemmex", 0, 0), None, None, (128, 1)),
+        (128, 1): (None, (128, 1), None, (32, 1)),
+        (192, 1): (None, (128, 0), (32, 2), (0, 1)),
+        (256, 1): (None, None, (32, 1), (0, 2)),
+        (384, 1): (("lt", 0, 5), None, None, (32, 3)),
+        (512, 1): (("lt", 128, 2), (0, 0), None, None),
+        (768, 1): (None, ("gemmex", 0, 0), None, None),
+    },
+    1024: {
+        (24, 1): (("lt", 128, 3), None, (32, 2), (0, 5)),
+        (28, 1): (("lt", 128, 5), None, None, (0, 6)),
+        (29, 1): (("lt", 128, 2), None, None, (0, 6)),
+        (30, 1): (("lt", 32, 4), None, None, (0, 6)),
+        (31, 1): (("lt", 128, 3), None, (128, 2), (0, 6)),
+        (32, 1): (None, None, (32, 2), (0, 6)),
+        (48, 1): (("lt", 32, 5), (32, 5), None, (0, 5)),
+        (64, 1): (("lt", 32, 6), None, (128, 0), (128, 1)),
+        (96, 1): (("lt", 32, 5), (32, 3), (128, 2), (128, 3)),
+        (192, 1): (("lt", 32, 4), (128, 4), None, (32, 1)),
+        (320, 1): (("lt", 128, 6), ("gemmex", 0, 0), None, (32, 2)),
+        (384, 1): (("lt", 0, 3), (32, 1), (32, 2), (0, 3)),
+        (512, 1): (("lt", 32, 1), None, None, (32, 3)),
+        (768, 1): (("lt", 128, 3), (128, 2), (32, 4), ("cutlass", 0, 12)),
+        (1024, 1): (("gemmex", 0, 0), None, (32, 2), ("cutlass", 0, 12)),
+    },
+    2048: {
+        (16, 1): (("lt", 128, 3), None, (128, 1), None),
+        (24, 1): (("lt", 128, 0), None, (32, 2), (0, 4)),
+        (28, 1): (("gemmex", 0, 0), None, (32, 1), (0, 4)),
+        (29, 1): (("lt", 128, 0), None, (32, 1), (0, 4)),
+        (30, 1): (("lt", 128, 0), None, (128, 1), (0, 4)),
+        (31, 1): (("gemmex", 0, 0), None, (32, 6), (0, 4)),
+        (32, 1): (("gemmex", 0, 0), (0, 0), (32, 6), (0, 4)),
+        (48, 1): (None, (32, 2), None, (0, 5)),
+        (64, 1): (("lt", 32, 4), (32, 1), (32, 1), (0, 4)),
+        (96, 1): (("lt", 128, 2), (0, 3), (128, 1), (32, 1)),
+        (128, 1): (("lt", 32, 6), ("gemmex", 0, 0), (32, 1), (0, 4)),
+        (192, 1): (("lt", 32, 1), (128, 3), None, (0, 1)),
+        (256, 1): (("lt", 32, 5), (128, 3), None, (32, 3)),
+        (320, 1): (("lt", 32, 4), (32, 2), (0, 2), (0, 2)),
+        (384, 1): (None, (128, 2), (128, 3), None),
+        (512, 1): (("lt", 128, 3), (32, 6), (32, 6), (0, 3)),
+        (768, 1): (("lt", 128, 3), (32, 4), (32, 5), (32, 4)),
+        (1024, 1): (("lt", 128, 3), (0, 2), None, (32, 4)),
+    },
+    2560: {
+        (28, 1): (("lt", 32, 3), None, None, (0, 4)),
+        (29, 1): (("lt", 32, 3), None, None, (0, 4)),
+        (30, 1): (("lt", 128, 3), None, None, (0, 4)),
+        (31, 1): (("lt", 32, 3), (128, 1), None, (0, 4)),
+        (48, 1): (("lt", 32, 4), (0, 0), None, (0, 5)),
+        (64, 1): (("lt", 128, 4), (0, 0), None, (128, 3)),
+        (96, 1): (("lt", 128, 6), (32, 0), None, (128, 2)),
+        (128, 1): (("lt", 128, 6), (128, 0), None, (0, 4)),
+        (192, 1): (("lt", 0, 2), (32, 3), (128, 5), (128, 2)),
+        (384, 1): (("lt", 32, 2), (0, 0), (128, 4), (0, 3)),
+        (768, 1): (("lt", 128, 4), None, (32, 7), (32, 4)),
+        (1024, 1): (None, None, None, ("cutlass", 0, 12)),
+    },
+    4096: {
+        (4, 1): (("lt", 32, 2), None, (128, 1), None),
+        (48, 1): (None, (0, 0), (32, 0), (0, 4)),
+        (64, 1): (None, (0, 0), None, (0, 0)),
+        (96, 1): (("lt", 128, 4), (32, 4), (128, 5), (32, 4)),
+        (128, 1): (("lt", 32, 6), (128, 5), (32, 5), (0, 4)),
+        (192, 1): (("lt", 32, 3), (128, 4), (128, 3), (32, 4)),
+        (256, 1): (None, (32, 5), None, (0, 4)),
+        (320, 1): (("gemmex", 0, 0), None, None, (32, 4)),
+        (384, 1): (("lt", 128, 4), (128, 5), (128, 3), (128, 4)),
+        (512, 1): (("lt", 128, 5), (32, 6), None, (0, 4)),
+    },
+}
+
+SM120_SM170_NATIVE_DENSE_ACCEPTED_BT = {
+    ("fp16", 768): _bnt1(16, 24, 30, 31, 32, 48, 64, 96, 128, 192, 256, 384, 512),
+    ("fp32io16", 768): _bnt1(16, 24, 31, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768),
+    ("fp16", 1024): _bnt1(24, 28, 29, 30, 31, 32, 64, 96, 192, 320, 384, 512, 768, 1024),
+    ("fp32io16", 1024): _bnt1(24, 28, 29, 30, 31, 32, 48, 64, 96, 192, 320, 384, 512, 768, 1024),
+    ("fp16", 2048): _bnt1(16, 24, 28, 29, 30, 31, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 768, 1024),
+    ("fp32io16", 2048): _bnt1(16, 24, 28, 29, 30, 31, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 768, 1024),
+    ("fp16", 2560): _bnt1(28, 29, 30, 48, 64, 96, 128, 192, 384, 768, 1024),
+    ("fp32io16", 2560): _bnt1(28, 29, 30, 31, 48, 64, 96, 128, 192, 384),
+    ("fp16", 4096): _bnt1(4, 48, 96, 128, 192, 256, 320, 384, 512),
+    ("fp32io16", 4096): _bnt1(4, 48, 64, 96, 128, 192, 256),
+}
+
+# Some dense combinations lost E2E even though individual groups were faster.
+# Keep only the groups that passed per-group ablation and a second merged real-
+# model gate. This table is precision-scoped because the accepted subsets are
+# not interchangeable between FP16 and FP32IO16.
+SM120_SM170_NATIVE_DENSE_PARTIAL_CONFIGS_BY_PRECISION_C = {
+    ("fp16", 768): {
+        (28, 1): (None, None, (128, 4), (32, 2)),
+        (320, 1): (("lt", 32, 0), (32, 0), None, None),
+        (768, 1): (None, ("gemmex", 0, 0), None, None),
+    },
+    ("fp32io16", 768): {
+        (28, 1): (None, None, (128, 4), (32, 2)),
+        (30, 1): (None, None, (128, 6), None),
+        (320, 1): (("lt", 32, 0), (32, 0), None, None),
+    },
+    ("fp16", 1024): {
+        (48, 1): (("lt", 32, 5), None, None, (0, 5)),
+    },
+    ("fp16", 2560): {
+        (24, 1): (("lt", 32, 3), None, None, None),
+        (31, 1): (("lt", 32, 3), None, None, (0, 4)),
+    },
+    ("fp32io16", 2560): {
+        (16, 1): (("lt", 32, 2), (0, 1), (128, 1), None),
+        (24, 1): (("lt", 128, 3), None, None, (0, 5)),
+    },
+    ("fp16", 4096): {
+        (16, 1): (None, (128, 1), None, None),
+        (24, 1): (None, None, None, (0, 4)),
+        # The generic B28..31 key route has a sharp heuristic cliff on SM170.
+        # Keep these exact BnT1 shapes: widening by rows would also affect B1Tn.
+        (28, 1): (("lt", 0, 0), (0, 4), None, None),
+        (29, 1): (None, (0, 1), (128, 0), None),
+        (30, 1): (("lt", 0, 0), (0, 4), None, None),
+        (31, 1): (("lt", 0, 0), (0, 4), None, (0, 2)),
+        (64, 1): (None, None, None, (0, 0)),
+    },
+    ("fp32io16", 4096): {
+        (16, 1): (None, (128, 1), None, None),
+        (24, 1): (None, None, None, (0, 4)),
+        (28, 1): (("lt", 0, 0), (0, 4), None, None),
+        (29, 1): (None, (0, 1), (128, 0), None),
+        (30, 1): (("lt", 0, 0), (0, 4), None, None),
+        (31, 1): (None, None, None, (0, 4)),
+    },
+}
+
+# A source profile can be faster precisely because it does not own an override
+# present in sm120-default. This sentinel blocks the inherited exact/row entry
+# and deliberately resumes the normal generic/CUTLASS fallback in the caller.
+GEMM_PROFILE_FALLBACK = object()
+
+
+def _sm120_profile_parts(profile: str, channels: int) -> tuple[dict, dict, dict, dict]:
+    by_profile = {
+        "default": (
+            SM120_DEFAULT_ORIG_ATT_C2C_GEMM_BY_C,
+            SM120_DEFAULT_ORIG_FFN_KEY_GEMM_BY_C,
+            SM120_DEFAULT_FFN_DOWN_GEMM_BY_C,
+            SM120_DEFAULT_HEAD_LAST_LOGITS_GEMM_BY_C,
+        ),
+        "sm82": (
+            SM120_SM82_ORIG_ATT_C2C_GEMM_BY_C,
+            SM120_SM82_ORIG_FFN_KEY_GEMM_BY_C,
+            SM120_SM82_FFN_DOWN_GEMM_BY_C,
+            SM120_SM82_HEAD_LAST_LOGITS_GEMM_BY_C,
+        ),
+        "sm188": (
+            SM120_SM188_ORIG_ATT_C2C_GEMM_BY_C,
+            SM120_SM188_ORIG_FFN_KEY_GEMM_BY_C,
+            SM120_SM188_FFN_DOWN_GEMM_BY_C,
+            SM120_SM188_HEAD_LAST_LOGITS_GEMM_BY_C,
+        ),
+    }
+    return tuple(table_by_c.get(channels, {}) for table_by_c in by_profile[profile])
+
+
+def _sm170_exact_table(
+    baseline: dict,
+    source_tables_and_shapes: tuple[tuple[dict, frozenset[tuple[int, int]]], ...],
+) -> dict:
+    result = dict(baseline)
+    for source, shapes in source_tables_and_shapes:
+        for batch, tokens in shapes:
+            result[(batch, tokens)] = source.get(
+                (batch, tokens), source.get(batch * tokens, GEMM_PROFILE_FALLBACK))
+    return result
+
+
+def _sm170_profile_parts(precision: str, channels: int) -> tuple[dict, dict, dict, dict]:
+    baseline = _sm120_profile_parts("default", channels)
+    sources = []
+    for source_name in ("sm82", "sm188"):
+        accepted = SM120_SM170_DENSE_ACCEPTED_BT.get(
+            (source_name, precision, channels), frozenset())
+        if accepted:
+            sources.append((_sm120_profile_parts(source_name, channels), accepted))
+    result = tuple(
+        _sm170_exact_table(
+            baseline[index],
+            tuple((source[index], accepted) for source, accepted in sources),
+        )
+        for index in range(4)
+    )
+    native_configs = SM120_SM170_NATIVE_DENSE_CONFIGS_BY_C.get(channels, {})
+    for shape in SM120_SM170_NATIVE_DENSE_ACCEPTED_BT.get(
+        (precision, channels), ()
+    ):
+        configs = native_configs[shape]
+        for index, config in enumerate(configs):
+            if config is not None:
+                result[index][shape] = config
+    for shape, configs in (
+        SM120_SM170_NATIVE_DENSE_PARTIAL_CONFIGS_BY_PRECISION_C.get(
+            (precision, channels), {}
+        ).items()
+    ):
+        for index, config in enumerate(configs):
+            if config is not None:
+                result[index][shape] = config
+    return result
+
 SM120_GEMM_PROFILE_TABLES = {
     **{
         ("sm120-default", channels): (
@@ -983,7 +1257,20 @@ SM120_GEMM_PROFILE_TABLES = {
         )
         for channels in (768, 1024, 2048, 2560, 4096)
     },
+    **{
+        ("sm120-sm170", channels, precision): _sm170_profile_parts(
+            precision, channels)
+        for precision in ("fp16", "fp32io16")
+        for channels in (768, 1024, 2048, 2560, 4096)
+    },
 }
+
+
+def active_gemm_profile_tables(profile: str, channels: int):
+    return SM120_GEMM_PROFILE_TABLES.get(
+        (profile, channels, WKV_MODE),
+        SM120_GEMM_PROFILE_TABLES.get((profile, channels)),
+    )
 
 
 def gemm_profile_config(table: dict, x: torch.Tensor, rows: int):
@@ -1134,6 +1421,67 @@ SM120_SM82_WKV_FP16_PATH_OVERRIDES_BY_C = {
     4096: SM120_SM82_WKV_FP16_PATH_OVERRIDES_4096,
 }
 
+# Exact WKV routes admitted on the 170-SM RTX 5090 FE at requested
+# 1500 MHz / 450 W. Unlike dense GEMMs these tables are precision-specific by
+# construction: FP16 stores recurrent state in half, while FP32IO16 selects a
+# different CUDA implementation and mode ID.
+SM120_SM170_WKV_FP32_MODES_BY_C = {
+    768: {
+        (2, 1): 6,
+        **{(batch, 1): 7 for batch in (4, 29, 30, 31, 32, 768)},
+        (1024, 1): 8,
+    },
+    1024: {
+        **{(batch, 1): 7 for batch in (2, 4, 24)},
+        **{(batch, 1): 8 for batch in (320, 768, 1024)},
+    },
+    2048: {
+        (320, 1): 7,
+        **{(batch, 1): 8 for batch in (384, 512, 768)},
+    },
+    2560: {
+        (64, 16): 9,
+        (256, 1): 7,
+        **{(batch, 1): 8 for batch in (320, 384, 512)},
+    },
+    4096: {
+        **{bt: 9 for bt in (
+            (16, 8), (16, 16), (32, 8), (16, 32),
+            (32, 16), (16, 64), (32, 32),
+        )},
+        (192, 1): 8,
+        (256, 1): 8,
+    },
+}
+SM120_SM170_WKV_FP16_PATH_OVERRIDES_BY_C = {
+    768: {
+        (16, 32): ("fused", "seq", "2d"),
+        (32, 32): ("fused", "exact", "flat"),
+        (384, 1): ("fused", "spill48", "flat"),
+        (1024, 1): ("fused", "vector", "2d"),
+    },
+    1024: {
+        (256, 1): ("fused", "spill48", "flat"),
+        (320, 1): ("fused", "spill48", "flat"),
+        (512, 1): ("fused", "vector", "2d"),
+        (64, 16): ("fused", "warp", "flat"),
+        (1024, 1): ("fused", "vector", "2d"),
+    },
+    2048: {
+        (4, 1): ("fused", "auto", "2d"),
+        (384, 1): ("fused", "vector", "2d"),
+        (8, 64): ("fused", "auto", "flat"),
+    },
+    2560: {
+        (384, 1): ("fused", "vector", "2d"),
+        (8, 128): ("fused", "exact", "flat"),
+        (32, 32): ("fused", "auto", "flat"),
+    },
+    4096: {
+        (256, 1): ("fused", "vector", "2d"),
+    },
+}
+
 
 def sm120_sm82_wkv_fp16_t1_range_override(B: int, T: int):
     if T != 1:
@@ -1233,7 +1581,7 @@ def main() -> None:
     parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp32io16 is more accurate
     parser.add_argument(
         "--wkv-fp32-profile",
-        choices=("auto", "generic", "sm120-sm82"),
+        choices=("auto", "generic", "sm120-sm82", "sm120-sm170"),
         default=WKV_FP32_PROFILE_MODE)
     parser.add_argument(
         "--deltalog", action="store_true",
@@ -1241,7 +1589,7 @@ def main() -> None:
     parser.add_argument("--wkv-fp16-policy", choices=("current", "tuned"), default=WKV_FP16_POLICY)
     parser.add_argument(
         "--wkv-fp16-device-profile",
-        choices=("auto", "generic", "sm120-sm82"),
+        choices=("auto", "generic", "sm120-sm82", "sm120-sm170"),
         default=WKV_FP16_DEVICE_PROFILE_MODE)
     parser.add_argument("--wkv-bh-grid", choices=("current", "tuned"), default=WKV_BH_GRID_MODE)
     parser.add_argument("--add-vec", choices=("current", "tuned"), default=ADD_VEC_MODE)
@@ -1285,7 +1633,9 @@ def main() -> None:
         default=ROWS_CUTLASS_MODE)
     parser.add_argument(
         "--gemm-profile",
-        choices=("auto", "generic", "sm120-default", "sm120-sm82", "sm120-sm188"),
+        choices=(
+            "auto", "generic", "sm120-default", "sm120-sm82",
+            "sm120-sm170", "sm120-sm188"),
         default=GEMM_PROFILE_MODE)
     parser.add_argument("--vres-gate", choices=("current", "tuned"), default=VRES_GATE_MODE)
     parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
@@ -1402,6 +1752,11 @@ def wkv_fp16_path_override(B: int, T: int, C: int, H: int):
             if C == 4096 else None)
         if range_override is not None:
             return range_override
+    if WKV_FP16_DEVICE_PROFILE_ACTIVE == "sm120-sm170":
+        device_override = SM120_SM170_WKV_FP16_PATH_OVERRIDES_BY_C.get(
+            C, {}).get((B, T))
+        if device_override is not None:
+            return device_override
     return WKV_FP16_PATH_OVERRIDES_BY_C.get(C, {}).get((B, T))
 
 
@@ -1588,13 +1943,19 @@ def select_gemm_profile() -> None:
         if (
             properties.minor == 0
             and properties.multi_processor_count == 82
-            and ("sm120-sm82", C) in SM120_GEMM_PROFILE_TABLES
+            and active_gemm_profile_tables("sm120-sm82", C) is not None
         ):
             detected_profile = "sm120-sm82"
         elif (
             properties.minor == 0
+            and properties.multi_processor_count == 170
+            and active_gemm_profile_tables("sm120-sm170", C) is not None
+        ):
+            detected_profile = "sm120-sm170"
+        elif (
+            properties.minor == 0
             and properties.multi_processor_count == 188
-            and ("sm120-sm188", C) in SM120_GEMM_PROFILE_TABLES
+            and active_gemm_profile_tables("sm120-sm188", C) is not None
         ):
             detected_profile = "sm120-sm188"
     CUDA_DEVICE_PROFILE_ACTIVE = detected_profile
@@ -1603,21 +1964,33 @@ def select_gemm_profile() -> None:
     else:
         GEMM_PROFILE_ACTIVE = GEMM_PROFILE_MODE
     if WKV_FP32_PROFILE_MODE == "auto":
-        # The 188-SM profile currently owns GEMM only. Its WKV schedules have
-        # not passed the 82-SM profile's exact-shape correctness/E2E gates.
-        WKV_FP32_PROFILE_ACTIVE = (
-            "sm120-sm82"
-            if detected_profile == "sm120-sm82"
+        if (
+            detected_profile == "sm120-sm82"
             and C in SM120_SM82_WKV_FP32_MODES_BY_C
-            else "generic")
+        ):
+            WKV_FP32_PROFILE_ACTIVE = "sm120-sm82"
+        elif (
+            detected_profile == "sm120-sm170"
+            and C in SM120_SM170_WKV_FP32_MODES_BY_C
+        ):
+            WKV_FP32_PROFILE_ACTIVE = "sm120-sm170"
+        else:
+            WKV_FP32_PROFILE_ACTIVE = "generic"
     else:
         WKV_FP32_PROFILE_ACTIVE = WKV_FP32_PROFILE_MODE
     if WKV_FP16_DEVICE_PROFILE_MODE == "auto":
-        WKV_FP16_DEVICE_PROFILE_ACTIVE = (
-            "sm120-sm82"
-            if detected_profile == "sm120-sm82"
+        if (
+            detected_profile == "sm120-sm82"
             and C in SM120_SM82_WKV_FP16_PATH_OVERRIDES_BY_C
-            else "generic")
+        ):
+            WKV_FP16_DEVICE_PROFILE_ACTIVE = "sm120-sm82"
+        elif (
+            detected_profile == "sm120-sm170"
+            and C in SM120_SM170_WKV_FP16_PATH_OVERRIDES_BY_C
+        ):
+            WKV_FP16_DEVICE_PROFILE_ACTIVE = "sm120-sm170"
+        else:
+            WKV_FP16_DEVICE_PROFILE_ACTIVE = "generic"
     else:
         WKV_FP16_DEVICE_PROFILE_ACTIVE = WKV_FP16_DEVICE_PROFILE_MODE
     log(
@@ -1636,6 +2009,8 @@ def select_gemm_profile() -> None:
 def wkv_fp32_mode(batch: int, tokens: int) -> int:
     if WKV_FP32_PROFILE_ACTIVE == "sm120-sm82":
         return SM120_SM82_WKV_FP32_MODES_BY_C.get(C, {}).get((batch, tokens), 0)
+    if WKV_FP32_PROFILE_ACTIVE == "sm120-sm170":
+        return SM120_SM170_WKV_FP32_MODES_BY_C.get(C, {}).get((batch, tokens), 0)
     return 0
 
 def cuda_mem() -> str:
@@ -2643,12 +3018,14 @@ class RWKV7:
         return self.linear_ffn_down(k, z[p+"value.weight"], path.rows)
 
     def linear_ffn_down(self, x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
-        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        profile_tables = active_gemm_profile_tables(GEMM_PROFILE_ACTIVE, C)
         if profile_tables is not None and tuple(weight.shape) == (4 * C, C):
             # Lt indices are tied to the exact GPU profile selected at model load.
             # Keep the non-strict call so CUDA/driver heuristic changes fall
             # back to algo 0 instead of turning an optional tuning into failure.
             profile_cfg = gemm_profile_config(profile_tables[2], x, rows)
+            if profile_cfg is GEMM_PROFILE_FALLBACK:
+                profile_cfg = None
             if profile_cfg is not None:
                 workspace_mb, algo_index = profile_cfg
                 return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
@@ -2694,7 +3071,7 @@ class RWKV7:
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
-        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        profile_tables = active_gemm_profile_tables(GEMM_PROFILE_ACTIVE, C)
         if profile_tables is not None and tuple(z["head.weight"].shape) == (V, C):
             # The head GEMM has B rows while the body has B*T rows. Keep the
             # exact (B,T) gate: adjacent T values flipped in dual-order E2E.
@@ -2705,6 +3082,8 @@ class RWKV7:
                 and (rows, tokens_count)
                 in SM120_SM82_HEAD_LAST_LOGITS_FP16_ONLY_BT_BY_C.get(C, ())
             ):
+                profile_cfg = None
+            if profile_cfg is GEMM_PROFILE_FALLBACK:
                 profile_cfg = None
             if profile_cfg is not None:
                 # Do not turn these into ranges. On the 175W laptop, several
@@ -2743,13 +3122,15 @@ class RWKV7:
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
         if not use_orig_linear(group):
             return self.linear(x, weight)
-        profile_tables = SM120_GEMM_PROFILE_TABLES.get((GEMM_PROFILE_ACTIVE, C))
+        profile_tables = active_gemm_profile_tables(GEMM_PROFILE_ACTIVE, C)
         if profile_tables is not None:
             if group == "att_c2c" and tuple(weight.shape) == (C, C):
                 profile_cfg = gemm_profile_config(profile_tables[0], x, path.rows)
             elif group == "ffn_key" and tuple(weight.shape) == (4 * C, C):
                 profile_cfg = gemm_profile_config(profile_tables[1], x, path.rows)
             else:
+                profile_cfg = None
+            if profile_cfg is GEMM_PROFILE_FALLBACK:
                 profile_cfg = None
             # FP32IO16 B288 is the 24 GiB boundary.  The FP16 winners reserve
             # another 32 MiB for both attention and key.  Keep both GEMMs on
