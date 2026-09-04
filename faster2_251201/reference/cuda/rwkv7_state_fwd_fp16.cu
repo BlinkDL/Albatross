@@ -569,7 +569,8 @@ __global__ void __launch_bounds__(COPY_ZERO_X, 1) shift_conv(
     const int S = B*T*C2;
     for (int c = threadIdx.x; c<C2; c += blockDim.x) {
         const int cur = bt*C2+c;
-        const common128 x_val = {.I = ((const int4*)x)[cur]}; // [b][t][c]
+        common128 x_val;
+        x_val.I = ((const int4*)x)[cur]; // [b][t][c]
         common128 x_shifted_val;
         if (t == 0) {
             x_shifted_val.I = ((const int4*)x_prev)[b*C2+c];
@@ -584,7 +585,8 @@ __global__ void __launch_bounds__(COPY_ZERO_X, 1) shift_conv(
         }
         #pragma unroll
         for (int q=0; q<6; q++){
-            const common128 xmix_coeff = {.I = ((const int4*)x_mixing)[q*C2+c]}; //[q][c]
+            common128 xmix_coeff;
+            xmix_coeff.I = ((const int4*)x_mixing)[q*C2+c]; //[q][c]
             common128 result;
             #pragma unroll
             for (int i=0; i<4; i++) {
@@ -732,8 +734,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt = make_uint4((unsigned)V, 0, 0, 0);
+    l4 = make_float4(1, 0, 0, 0);
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         // if(t==0){

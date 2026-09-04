@@ -25,12 +25,13 @@ from torch.nn import functional as F
 
 from torch.library import Library, impl
 
-# MyModule = torch.jit.ScriptModule
-# MyFunction = torch.jit.script_method
-# MyStatic = torch.jit.script
-MyModule = nn.Module
-MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
-MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
+MyModule = torch.jit.ScriptModule
+MyFunction = torch.jit.script_method
+MyStatic = torch.jit.script
+# ⬇️ Need to install Triton
+# MyModule = nn.Module
+# MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
+# MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
 def __nop(ob): return ob
 # MyFunction = __nop
 # MyStatic = __nop
@@ -54,7 +55,7 @@ load(
         f"-D_N_={HEAD_SIZE}", 
         # f"-gencode=arch=compute_{sm_X}{sm_Y},code=sm_{sm_X}{sm_Y}"
     ] + (
-        ["-Xptxas -O3"] if os.name != "nt" else []
+        ["-Xptxas -O3"] if os.name != "nt" else ["-Xcompiler", "/Zc:preprocessor"]
     )
 )
 
