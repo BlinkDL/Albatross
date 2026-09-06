@@ -2,7 +2,7 @@
 
 UPDATE: faster3a_2607 and faster3a_2605 are up to 47% faster now, with DeltaLog (use --deltalog) and new [K,V] state layout.
 
-UPDATE: faster3a_2607 is faster than faster3a_2605 (only tuned for 7B).
+UPDATE: faster3a_2607 is faster than faster3a_2605 (UPDATE: now faster and recommended. Use it as reference. Note there are some interesting demos in v3a_2605 which are compatible).
 ```
 RESULT B=1 T=1 iters=3 p10_ms=6.8555 p50_ms=6.8585 p90_ms=6.9575 tok_s_p50=145.80
 RESULT B=1 T=2 iters=3 p10_ms=7.1599 p50_ms=7.1634 p90_ms=7.2747 tok_s_p50=279.20
