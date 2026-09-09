@@ -244,6 +244,18 @@ CMIX_SPARSE = "no-fc"
 LOWRANK_WEIGHT = "both"
 ORIG_LINEAR_GROUPS = {"att_c2c", "ffn_key", "head"}
 PP_DEVICES: list[int] = []
+# Set before constructing RWKV7; these opt-outs support hosts with restricted
+# GPU initialization (e.g. HF Gradio ZeroGPU integrations). Keep both True on
+# ordinary CUDA hosts. They do not make model construction entirely CUDA-free.
+# True: precompute LN0 for the whole vocabulary once during model loading.
+# False: store raw embeddings and run LN0 on selected tokens on every embed().
+# This avoids the load-time LN0 kernel, but adds inference work and uses FP16
+# LN0 parameters instead of the BF16-source precompute (rounding may differ).
+PRECOMPUTE_EMB_LN0 = True
+# False: skip only the final sync_all() and CUDA memory report in __init__.
+# Weight transfers/other CUDA work remain; the model-ready timer then need not
+# include GPU completion. This flag does not change steady-state inference.
+SYNC_INIT = True
 LOWRANK_SUFFIXES = ("att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2", "att.v1", "att.v2")
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
@@ -2281,36 +2293,44 @@ class RWKV7:
             else:
                 z[key] = value
         emb_dev = first_device()
-        ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
-        ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
-        if emb_cpu is None:
-            with torch.cuda.device(emb_dev):
-                z["emb.weight"] = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
-                    emb_src.to(device=emb_dev).contiguous(), ln0_w_bf16, ln0_b_bf16)
+        if PRECOMPUTE_EMB_LN0:
+            ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
+            ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
+            if emb_cpu is None:
+                with torch.cuda.device(emb_dev):
+                    z["emb.weight"] = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
+                        emb_src.to(device=emb_dev).contiguous(), ln0_w_bf16, ln0_b_bf16)
+            else:
+                emb = torch.empty((V,C), dtype=DTYPE, pin_memory=True)
+                with torch.cuda.device(emb_dev):
+                    for start in range(0, V, 4096):
+                        end = min(start + 4096, V)
+                        chunk = emb_cpu[start:end].to(device=emb_dev).contiguous()
+                        chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
+                        emb[start:end].copy_(chunk)
+                z["emb.weight"] = emb
+        elif emb_cpu is None:
+            z["emb.weight"] = emb_src.to(device=emb_dev, dtype=DTYPE).contiguous()
         else:
-            emb = torch.empty((V,C), dtype=DTYPE, pin_memory=True)
-            with torch.cuda.device(emb_dev):
-                for start in range(0, V, 4096):
-                    end = min(start + 4096, V)
-                    chunk = emb_cpu[start:end].to(device=emb_dev).contiguous()
-                    chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
-                    emb[start:end].copy_(chunk)
-            z["emb.weight"] = emb
+            z["emb.weight"] = emb_src.to(dtype=DTYPE).contiguous().pin_memory()
         if RKV_MODE != "off" and not use_orig_linear("att_c2c"):
             for layer in range(L):
                 p = f"blocks.{layer}.att."
                 z[p+"rkv.weight"] = torch.stack((z[p+"receptance.weight"], z[p+"key.weight"], z[p+"value.weight"])).contiguous()
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
+        self.emb_ln0_runtime = not PRECOMPUTE_EMB_LN0
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.batch_rows_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.wkv_deltalog_workspace: dict[
             tuple[int, int, int, str], tuple[torch.Tensor, ...]
         ] = {}
         self.wkv_deltalog_sessions: dict[int, tuple[int, int, str] | None] = {}
-        sync_all()
+        if SYNC_INIT:
+            sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
-        log(cuda_mem())
+        if SYNC_INIT:
+            log(cuda_mem())
 
     def deltalog_workspace(
         self,
@@ -2593,7 +2613,8 @@ class RWKV7:
         if not self.emb_cpu:
             if tokens.device != self.z["emb.weight"].device:
                 tokens = tokens.to(self.z["emb.weight"].device, non_blocking=True)
-            return self.z["emb.weight"][tokens]
+            x = self.z["emb.weight"][tokens]
+            return self.ln(x, self.z["blocks.0.ln0.weight"], self.z["blocks.0.ln0.bias"]) if self.emb_ln0_runtime else x
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
         B, T = tokens.shape
@@ -2607,7 +2628,7 @@ class RWKV7:
             flat = flat.cpu()
         torch.index_select(self.z["emb.weight"], 0, flat, out=host)
         dev.copy_(host.view(B,T,C), non_blocking=True)
-        return dev
+        return self.ln(dev, self.z["blocks.0.ln0.weight"], self.z["blocks.0.ln0.bias"]) if self.emb_ln0_runtime else dev
 
     def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
         if pp_enabled():
