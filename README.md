@@ -66,6 +66,8 @@ Note: demo3.py has efficient standalone Python GUI and you can simply run it on 
 
 While for demo2.py, you have to SSH to the GPU computer to run demo2.py in a SSH session, such that the GPU won't be affected by slow terminal rendering.
 
+cd ./faster2_251201/demo4 and run "python app.py" to run the demo4
+
 ---
 
 ## Old Readme
