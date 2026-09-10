@@ -1,4 +1,4 @@
-import gc, html, re, threading, time
+import gc, html, json, re, threading, time
 import gradio as gr
 import torch
 from datetime import datetime
@@ -17,6 +17,10 @@ USE_CUDA_GRAPH = True
 html_gen_limit = 16000
 MAX_HTML_PREVIEWS = 30
 HTML_GRID_COLUMNS = 3
+MAX_BATCH_PREVIEWS = 320
+BATCH_GRID_COLUMNS = 10
+BATCH_UPDATE_INTERVAL = 0.5
+BATCH_YIELD_EVERY = 10
 HTML_DEFAULT_BATCH = min(MAX_HTML_PREVIEWS, max_bsz)
 HTML_MAX_BATCH = min(MAX_HTML_PREVIEWS, max_bsz)
 HTML_GRID_UPDATE_EVERY = 32
@@ -53,11 +57,10 @@ DEFAULT_HTML_PROMPT = html_prompt_from_choice(HTML_PROMPT_CHOICES[0])
 HTML_GRID_CSS = """
 div.main { padding-left: 0 !important; padding-right: 0 !important; }
 .html-grid-tab { padding-top: 0 !important; }
-.html-grid-main { display: grid !important; grid-template-columns: minmax(220px, 17.5%) 1fr !important; grid-template-rows: auto auto !important; gap: 4px !important; margin-top: 0 !important; align-items: start !important; }
+.html-grid-main { display: grid !important; grid-template-columns: minmax(220px, 17.5%) 1fr !important; grid-template-rows: auto !important; gap: 4px !important; margin-top: 0 !important; align-items: start !important; }
 .html-grid-main > div { gap: 4px !important; }
 .html-grid-controls { grid-column: 1 !important; grid-row: 1 !important; gap: 4px !important; min-width: 0 !important; }
-.html-grid-pages { grid-column: 2 !important; grid-row: 1 / span 2 !important; gap: 4px !important; min-width: 0 !important; }
-.html-grid-output { grid-column: 1 !important; grid-row: 2 !important; gap: 4px !important; min-width: 0 !important; }
+.html-grid-pages { grid-column: 2 !important; grid-row: 1 !important; gap: 4px !important; min-width: 0 !important; }
 .html-grid-preview-row { gap: 4px !important; margin: 0 !important; }
 .html-grid-preview { margin: 0 !important; }
 .html-grid-preview > div { margin: 0 !important; }
@@ -89,16 +92,22 @@ dialog.html-preview-expanded::backdrop { background:rgba(0,0,0,.72); }
 .html-preview-expanded .html-preview-frame { flex:1; min-height:0; height:100%!important; }
 .html-preview-expanded iframe { width:100%!important; height:100%!important; transform:none!important; }
 .html-preview-expanded .html-preview-raw { display:none!important; }
+.batch-preview-content { flex:1; min-height:0; overflow:auto; background:#fafafa; color:#111; }
+.batch-preview-content pre { margin:0; padding:8px; white-space:pre-wrap; overflow-wrap:anywhere; font:9.5px/1.4 monospace; letter-spacing:0; }
+.html-preview-expanded .batch-preview-content pre { font-size:32px; }
+.batch-text-grid { display:grid; min-width:1200px; grid-template-columns:repeat(var(--batch-grid-columns, 10), minmax(0, 1fr)); gap:4px; }
+.batch-grid-host { overflow-x:auto!important; min-width:0!important; }
+.batch-text-grid > dialog { width:100%; min-width:0; box-sizing:border-box; margin:0; }
+.batch-text-updates { display:none!important; }
 .html-prompt-choice { margin: 0 !important; padding: 0 !important; min-height: 0 !important; }
 .html-prompt-choice .wrap,
 .html-prompt-choice .wrap-inner,
 .html-prompt-choice .secondary-wrap { margin: 0 !important; padding: 0 !important; min-height: 0 !important; }
 .html-prompt-choice label { margin: 0 !important; padding: 0 !important; }
 @media (max-width: 768px) {
-  .html-grid-main { grid-template-columns: 1fr !important; grid-template-rows: auto auto auto !important; }
+  .html-grid-main { grid-template-columns: 1fr !important; grid-template-rows: auto auto !important; }
   .html-grid-controls { grid-column: 1 !important; grid-row: 1 !important; }
   .html-grid-pages { grid-column: 1 !important; grid-row: 2 !important; }
-  .html-grid-output { grid-column: 1 !important; grid-row: 3 !important; }
 }
 """
 
@@ -108,6 +117,44 @@ HTML_GRID_JS = r"""() => {
   if (window.__rwkvPreviewExpandInstalled) return;
   window.__rwkvPreviewExpandInstalled = true;
   let active = null;
+  function updateBatch(packet) {
+    const grid = document.getElementById('batch-text-grid');
+    if (!grid) return;
+    let data;
+    try { data = JSON.parse(packet.dataset.batchPacket); } catch { return; }
+    if (data.reset && active?.index.startsWith('batch-')) closePreview();
+    const dialogs = grid.querySelectorAll('dialog');
+    const scroll = [];
+    for (let i = 0; i < dialogs.length; i++) {
+      const dialog = dialogs[i];
+      const enabled = i < data.count;
+      const text = data.texts[i] || '';
+      const pane = dialog.querySelector('.batch-preview-content');
+      const pre = pane.querySelector('pre');
+      const previous = pre.textContent;
+      // Snapshots tolerate Gradio coalescing updates. Append only the suffix
+      // to a stable text node; generated markup is never parsed as HTML.
+      if (text !== previous) {
+        if (pre.firstChild && text.startsWith(previous)) pre.firstChild.appendData(text.slice(previous.length));
+        else pre.textContent = text;
+      }
+      const caption = enabled ? `#${i + 1} | ${(data.tokens[i] || 0).toLocaleString()} tokens` : `#${i + 1}`;
+      const label = dialog.querySelector('.html-preview-caption > span');
+      if (label.textContent !== caption) label.textContent = caption;
+      dialog.style.opacity = enabled ? '1' : '.35';
+      dialog.querySelector('.html-preview-expand').disabled = !enabled;
+      if (text !== previous || data.reset) scroll.push(pane);
+    }
+    // Batch layout reads before scroll writes; avoid 320 forced reflows.
+    if (scroll.length) requestAnimationFrame(() => {
+      const heights = scroll.map(pane => pane.scrollHeight);
+      scroll.forEach((pane, i) => { pane.scrollTop = heights[i]; });
+    });
+  }
+  function scrollText(dialog) {
+    const pane = dialog.querySelector('.batch-preview-content');
+    if (pane) requestAnimationFrame(() => { pane.scrollTop = pane.scrollHeight; });
+  }
   function notifyFrame(dialog, expanded) {
     dialog.querySelector('iframe')?.contentWindow?.postMessage(
       {type:'rwkv-preview-mode', expanded}, '*');
@@ -124,6 +171,7 @@ HTML_GRID_JS = r"""() => {
     }
     dialog.querySelector('.html-preview-close').focus({preventScroll:true});
     notifyFrame(dialog, true);
+    scrollText(dialog);
   }
   function closePreview() {
     if (!active) return;
@@ -136,6 +184,7 @@ HTML_GRID_JS = r"""() => {
     dialog.setAttribute('role', 'group');
     dialog.removeAttribute('aria-modal');
     dialog.setAttribute('open', '');
+    scrollText(dialog);
     document.documentElement.classList.remove('html-preview-modal-open');
     const target = saved.trigger.isConnected ? saved.trigger :
       document.querySelector(`dialog[data-preview-index="${saved.index}"] .html-preview-expand`);
@@ -146,7 +195,7 @@ HTML_GRID_JS = r"""() => {
     const button = event.target.closest?.('.html-preview-button');
     if (button?.classList.contains('html-preview-expand')) {
       const dialog = button.closest('dialog[data-preview-index]');
-      if (!dialog?.querySelector('iframe')) return;
+      if (!dialog?.querySelector('iframe, .batch-preview-content')) return;
       closePreview();
       active = {dialog, host:dialog.closest('.html-grid-preview'), index:dialog.dataset.previewIndex, trigger:button,
         x:window.scrollX, y:window.scrollY};
@@ -177,7 +226,26 @@ HTML_GRID_JS = r"""() => {
   });
   // Gradio replaces rendered HTML during streaming. Reopen only the same grid;
   // updates may reload content as before, but never lose the expanded mode.
-  new MutationObserver(() => {
+  new MutationObserver(records => {
+    // Follow only changed text outputs, not unrelated controls or manual scroll.
+    const changed = new Set();
+    for (const record of records) {
+      if (record.type === 'attributes' && record.attributeName === 'data-batch-packet') updateBatch(record.target);
+      if (record.type !== 'childList') continue;
+      const parent = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+      const pane = parent?.closest('.batch-preview-content');
+      if (pane) changed.add(pane);
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (node.matches('[data-batch-packet]')) updateBatch(node);
+        node.querySelectorAll('[data-batch-packet]').forEach(updateBatch);
+        if (node.matches('.batch-preview-content')) changed.add(node);
+        node.querySelectorAll('.batch-preview-content').forEach(el => changed.add(el));
+      }
+    }
+    if (changed.size) requestAnimationFrame(() => {
+      changed.forEach(pane => { if (pane.isConnected) pane.scrollTop = pane.scrollHeight; });
+    });
     if (!active) return;
     const next = document.querySelector(`dialog[data-preview-index="${active.index}"]`);
     // Gradio may clear HTML in one render pass and insert it in the next.
@@ -186,14 +254,14 @@ HTML_GRID_JS = r"""() => {
       if (!active.host?.isConnected) closePreview();
       return;
     }
-    if (!next.querySelector('iframe')) { closePreview(); return; }
+    if (!next.querySelector('iframe, .batch-preview-content')) { closePreview(); return; }
     // Some Gradio versions morph existing elements and reset their attributes
     // instead of replacing them. Restore the modal presentation in either case.
     if (next !== active.dialog || !next.classList.contains('html-preview-expanded') || !next.matches(':modal')) {
       active.dialog = next;
       promote(next);
     }
-  }).observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['class', 'open']});
+  }).observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['class', 'open', 'data-batch-packet']});
 }"""
 
 # Local Lucide Maximize2 / X icon geometry (ISC); no CDN dependency.
@@ -275,7 +343,8 @@ def sample_logits_batch_cuda(logits, temperature: float, top_p: float, k: int):
     return ids.gather(1, out).view(-1)
 
 def get_decode_ctx(B: int, decode_cache):
-    cached = decode_cache.get(B)
+    key = (B, v3a.WKV_MODE)
+    cached = decode_cache.get(key)
     if cached is not None:
         return cached
     state = model.zero_state(B)
@@ -297,7 +366,7 @@ def get_decode_ctx(B: int, decode_cache):
             graph = None
             output = None
     cached = (state, x, graph, output)
-    decode_cache[B] = cached
+    decode_cache[key] = cached
     return cached
 
 def copy_state_to_batch(dst, src):
@@ -352,7 +421,13 @@ def generate_batch_text(
     countPenalty = 0.1,
     penalty_decay = 0.99,
     yield_every = YIELD_EVERY,
+    wkv_mode = "fp32io16",
+    batch_limit = max_bsz,
+    combine_output = True,
 ):
+    # Both UI generators share one queue slot: never change the global route
+    # while another request is using its state or replaying a captured graph.
+    v3a.set_wkv_mode(wkv_mode)
     req_t0 = time.perf_counter()
     user_token_count = int(token_count)
     rwkv_model = model
@@ -369,7 +444,7 @@ def generate_batch_text(
     ctx = ctx.strip()
     input_ids = pipe.encode(ctx)[-ctx_limit:]
     input_token_count = len(input_ids)
-    B = min(max_bsz, max(1, int(batch_size)))
+    B = min(batch_limit, max(1, int(batch_size)))
     batch_rows = None
     all_tokens = [[] for _ in range(B)]
     out_last = [0 for _ in range(B)]
@@ -390,7 +465,7 @@ def generate_batch_text(
 
         if i == 0:
             if len(input_ids) == 0:
-                yield "", "", {"done": True, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "B": B, "T": user_token_count, "In": input_token_count, "TPS": 0.0, "Time": 0.0, "Token": 0, "Char": 0, "VRAMUsed": 0, "VRAMTotal": 0, "token_counts": [0 for _ in range(B)]}
+                yield "", "", {"done": True, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "B": B, "T": user_token_count, "In": input_token_count, "TPS": 0.0, "Time": 0.0, "Token": 0, "Char": 0, "VRAMUsed": 0, "VRAMTotal": 0, "token_counts": [0 for _ in range(B)], "texts": out_str.copy()}
                 return
             while len(input_ids) > 0:
                 token_device = "cpu" if rwkv_model.emb_cpu else "cuda"
@@ -455,23 +530,25 @@ def generate_batch_text(
         else:
             speed_tokens += B
             elapsed = max(1e-9, time.perf_counter() - speed_t0)
-            current_text = output_text(B, out_str)
-            speed_info = speed_text(speed_tokens / elapsed, B, total_tokens, len(current_text))
+            current_text = output_text(B, out_str) if combine_output else ""
+            char_count = len(current_text) if combine_output else sum(map(len, out_str))
+            speed_info = speed_text(speed_tokens / elapsed, B, total_tokens, char_count)
         if i == 0 or i % max(1, int(yield_every)) == 0:
-            current_text = output_text(B, out_str)
-            yield current_text, speed_info, {"done": False, "token_counts": [len(tokens) for tokens in all_tokens]}
+            current_text = output_text(B, out_str) if combine_output else ""
+            yield current_text, speed_info, {"done": False, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     free, total = torch.cuda.mem_get_info()
     del out
     del state
     del decode_cache
-    current_text = output_text(B, out_str)
+    current_text = output_text(B, out_str) if combine_output else ""
+    char_count = len(current_text) if combine_output else sum(map(len, out_str))
     if speed_t0 is not None and not speed_info:
-        speed_info = speed_text(0.0, B, total_tokens, len(current_text))
+        speed_info = speed_text(0.0, B, total_tokens, char_count)
     elapsed = time.perf_counter() - req_t0
     final_tps = speed_tokens / max(1e-9, time.perf_counter() - speed_t0) if speed_t0 is not None else 0.0
     used = total - free
-    meta = {"done": True, "timestamp": timestamp, "B": B, "T": user_token_count, "In": input_token_count, "TPS": final_tps, "Time": elapsed, "Token": total_tokens, "Char": len(current_text), "VRAMUsed": used, "VRAMTotal": total, "token_counts": [len(tokens) for tokens in all_tokens]}
+    meta = {"done": True, "timestamp": timestamp, "B": B, "T": user_token_count, "In": input_token_count, "TPS": final_tps, "Time": elapsed, "Token": total_tokens, "Char": char_count, "VRAMUsed": used, "VRAMTotal": total, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
     yield current_text, speed_info, meta
 
 def print_summary(prefix, meta):
@@ -492,7 +569,7 @@ def evaluate_raw(
     countPenalty = 0.1,
     penalty_decay = 0.99,
 ):
-    for text, speed_info, meta in generate_batch_text(ctx, token_count, batch_size, temperature, top_p, presencePenalty, countPenalty, penalty_decay, YIELD_EVERY):
+    for text, speed_info, meta in generate_batch_text(ctx, token_count, batch_size, temperature, top_p, presencePenalty, countPenalty, penalty_decay, YIELD_EVERY, wkv_mode="fp32io16"):
         if meta and meta.get("done"):
             print_summary("app3", meta)
         yield output_update(text, speed_info)
@@ -724,6 +801,48 @@ def render_preview(text="", index=0, scale=35, active=True, prompt="", token_cou
 {body}
 </dialog>"""
 
+def render_batch_preview(text="", index=0, active=True, token_count=None):
+    tokens = f"{token_count:,}" if token_count is not None else "-"
+    caption = f"#{index + 1} | {tokens} tokens, {len(text.encode('utf-8')):,} bytes" if active else ""
+    opacity = "1" if active else ".35"
+    buttons = (f'<button type="button" class="html-preview-button html-preview-expand" title="Expand text" aria-label="Expand text {index + 1}">{HTML_EXPAND_ICON}</button>'
+               f'<button type="button" class="html-preview-button html-preview-close" title="Close preview" aria-label="Close preview">{HTML_CLOSE_ICON}</button>') if active else ""
+    # Generated markup is text, never srcdoc/innerHTML. Separate IDs prevent
+    # streamed Batch updates from selecting an HTML tab's expanded dialog.
+    return f'''<dialog open role="group" aria-label="Text {index + 1}" data-preview-index="batch-{index}" class="html-container" style="outline:1px solid #111;background:#fff;opacity:{opacity};height:120px;display:flex;flex-direction:column;padding:0;">
+<div class="html-preview-caption" style="box-sizing:border-box;height:{HTML_CAPTION_HEIGHT}px;padding:1px 6px;background:#111;color:#fff;font:11px/13px monospace;"><span>{caption}</span>{buttons}</div>
+<div class="batch-preview-content" tabindex="0" aria-label="Output {index + 1}"><pre>{html.escape(text)}</pre></div>
+</dialog>'''
+
+
+def evaluate_batch(
+    prompt, token_count=2000, batch_size=MAX_BATCH_PREVIEWS, temperature=1.0, top_p=0.5,
+    presence_penalty=1.0, count_penalty=0.1, penalty_decay=0.99,
+):
+    B = max(1, min(MAX_BATCH_PREVIEWS, int(batch_size)))
+    yield batch_update_packet(B, [], [], reset=True), ""
+    last_update = 0.0
+    for _, speed, meta in generate_batch_text(
+        prompt, token_count, B, temperature, top_p, presence_penalty,
+        count_penalty, penalty_decay, BATCH_YIELD_EVERY, wkv_mode="fp16", batch_limit=MAX_BATCH_PREVIEWS, combine_output=False,
+    ):
+        now = time.monotonic()
+        if not meta['done'] and now - last_update < BATCH_UPDATE_INTERVAL:
+            continue
+        last_update = now
+        # Do not split the combined text by separators: a model can emit them.
+        texts, counts = meta['texts'], meta['token_counts']
+        yield batch_update_packet(B, texts, counts), speed
+        if meta['done']:
+            print_summary("app4b-batch-fp16", meta)
+
+
+def batch_update_packet(count, texts, tokens, reset=False):
+    # One escaped data packet instead of 320 HTML component replacements.
+    data = json.dumps(dict(count=count, texts=texts, tokens=tokens, reset=reset), ensure_ascii=False, separators=(',', ':'))
+    return f'<span data-batch-packet="{html.escape(data, quote=True)}"></span>'
+
+
 def empty_html_grid():
     return [render_preview("", i, active=False) for i in range(MAX_HTML_PREVIEWS)]
 
@@ -765,7 +884,7 @@ def evaluate_html_grid(
     final_text = ""
     final_token_counts = [0 for _ in range(MAX_HTML_PREVIEWS)]
     yield [*cached_previews, output_update("", compact=True), final_token_counts, page_count]
-    for text, speed_info, meta in generate_batch_text(prompt, token_count, page_count, temperature, top_p, presence_penalty, count_penalty, penalty_decay, HTML_GRID_UPDATE_EVERY):
+    for text, speed_info, meta in generate_batch_text(prompt, token_count, page_count, temperature, top_p, presence_penalty, count_penalty, penalty_decay, HTML_GRID_UPDATE_EVERY, wkv_mode="fp32io16"):
         final_text = text
         done_batch = bool(meta and meta.get("done"))
         token_counts = meta.get("token_counts", final_token_counts) if meta else final_token_counts
@@ -879,7 +998,7 @@ with gr.Blocks(title=title) as demo:
                     stop = gr.Button("Stop", variant="secondary")
                 output = gr.Textbox(label="Output", lines=20, max_lines=100)
         data = gr.Dataset(components=[prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay], samples=examples, samples_per_page=50, label="Example Instructions", headers=["Prompt", "Max Tokens", "Batch Size", "Temperature", "Top P", "Presence Penalty", "Count Penalty", "Penalty Decay"])
-        submit_event = submit.click(evaluate_raw, [prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay], [output])
+        submit_event = submit.click(evaluate_raw, [prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay], [output], concurrency_id="model_generation", concurrency_limit=1)
         stop.click(fn=None, inputs=None, outputs=None, cancels=[submit_event], queue=False)
         data.click(lambda x: x, [data], [prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay])
 
@@ -902,22 +1021,47 @@ with gr.Blocks(title=title) as demo:
                 html_penalty_decay = gr.Slider(0.99, 0.999, label="Penalty Decay", step=0.001, value=0.99)
                 html_token_counts = gr.State([0 for _ in range(MAX_HTML_PREVIEWS)])
                 html_render_count = gr.State(HTML_DEFAULT_BATCH)
+                html_raw_output = gr.Textbox(label="Output", lines=10, max_lines=40)
             with gr.Column(scale=33, elem_classes="html-grid-pages"):
                 html_previews = []
                 for row_start in range(0, MAX_HTML_PREVIEWS, HTML_GRID_COLUMNS):
                     with gr.Row(elem_classes="html-grid-preview-row"):
                         for i in range(row_start, min(row_start + HTML_GRID_COLUMNS, MAX_HTML_PREVIEWS)):
                             html_previews.append(gr.HTML(render_preview(index=i, active=False), elem_classes="html-grid-preview"))
-            with gr.Column(scale=7, elem_classes="html-grid-output"):
-                html_raw_output = gr.Textbox(label="Output", lines=10, max_lines=40)
         html_outputs = [*html_previews, html_raw_output, html_token_counts, html_render_count]
         html_inputs = [html_prompt, html_token_count, html_page_count, html_scale, html_scroll_seconds, html_temperature, html_top_p, html_presence_penalty, html_count_penalty, html_penalty_decay]
-        html_event = html_submit.click(evaluate_html_grid, html_inputs, html_outputs, show_progress="hidden", stream_every=0.5)
+        html_event = html_submit.click(evaluate_html_grid, html_inputs, html_outputs, show_progress="hidden", stream_every=0.5, concurrency_id="model_generation", concurrency_limit=1)
         html_stop.click(fn=None, inputs=None, outputs=None, cancels=[html_event], queue=False)
         html_page_count.change(render_html_grid_from_slider, [html_prompt, html_raw_output, html_page_count, html_scale, html_scroll_seconds, html_token_counts], [*html_previews, html_render_count], queue=False, show_progress="hidden")
         html_scale.change(render_html_grid_from_raw, [html_prompt, html_raw_output, html_render_count, html_scale, html_scroll_seconds, html_token_counts], html_previews, queue=False, show_progress="hidden")
         html_scroll_seconds.change(render_html_grid_from_raw, [html_prompt, html_raw_output, html_render_count, html_scale, html_scroll_seconds, html_token_counts], html_previews, queue=False, show_progress="hidden")
         html_prompt_choice.change(html_prompt_from_choice, html_prompt_choice, html_prompt, queue=False, show_progress="hidden")
+
+    with gr.Tab("Batch", elem_classes="html-grid-tab"):
+        with gr.Row(elem_classes="html-grid-main"):
+            with gr.Column(elem_classes="html-grid-controls"):
+                batch_prompt = gr.Textbox(lines=6, label="Prompt", value="User: 作为哲学家，锐评下列文字：我吃饭了\n\nAssistant: <think")
+                with gr.Row():
+                    batch_submit = gr.Button("Generate", variant="primary")
+                    batch_stop = gr.Button("Stop", variant="secondary")
+                batch_tokens = gr.Slider(10, html_gen_limit, label="Max Tokens", step=10, value=2000)
+                batch_count = gr.Slider(1, MAX_BATCH_PREVIEWS, label="Batch Size", step=1, value=MAX_BATCH_PREVIEWS)
+                batch_temperature = gr.Slider(0.2, 2.0, label="Temperature", step=0.1, value=1.0)
+                batch_top_p = gr.Slider(0.0, 0.95, label="Top P", step=0.05, value=0.5)
+                batch_presence = gr.Slider(0.0, 2.0, label="Presence Penalty", step=0.1, value=1.0)
+                batch_frequency = gr.Slider(0.0, 1.0, label="Count Penalty", step=0.1, value=0.1)
+                batch_decay = gr.Slider(0.99, 0.999, label="Penalty Decay", step=0.001, value=0.99)
+                batch_speed = gr.Textbox(label="Speed", interactive=False)
+            with gr.Column(elem_classes="html-grid-pages"):
+                gr.HTML(f'<div id="batch-text-grid" class="batch-text-grid" style="--batch-grid-columns:{BATCH_GRID_COLUMNS}">' + ''.join(render_batch_preview(index=i) for i in range(MAX_BATCH_PREVIEWS)) + '</div>', elem_classes="batch-grid-host")
+                batch_updates = gr.HTML('', elem_classes="batch-text-updates")
+        batch_event = batch_submit.click(
+            evaluate_batch,
+            [batch_prompt, batch_tokens, batch_count, batch_temperature, batch_top_p, batch_presence, batch_frequency, batch_decay],
+            [batch_updates, batch_speed], show_progress="hidden", stream_every=0.5,
+            concurrency_id="model_generation", concurrency_limit=1,
+        )
+        batch_stop.click(fn=None, inputs=None, outputs=None, cancels=[batch_event], queue=False)
 
     # Event registration must stay inside Blocks, including JS-only callbacks.
     demo.load(fn=None, inputs=None, outputs=None, js=HTML_GRID_JS)

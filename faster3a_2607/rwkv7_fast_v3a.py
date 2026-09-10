@@ -2158,7 +2158,27 @@ def is_orig_linear_weight(key: str) -> bool:
         or (use_orig_linear("head") and key == "head.weight")
     )
 
+_LOADED_WKV_MODES: set[str] = set()
+
+
+def set_wkv_mode(wkv_mode: str) -> None:
+    """Select the process-wide WKV route without reloading model weights.
+
+    Call between requests, not during inference/capture. Discard old states
+    and CUDA graphs, then create new ones; neither is converted by this API.
+    Directly assigning WKV_MODE does not load a missing CUDA extension.
+    """
+    global WKV_MODE
+    # Publish only after loading succeeds, so a failed build keeps the old route.
+    load_extensions(wkv_mode)
+    WKV_MODE = wkv_mode
+
+
 def load_extensions(wkv_mode: str = "fp16") -> None:
+    if wkv_mode not in ("fp16", "fp32io16"):
+        raise ValueError(f"unknown wkv_mode: {wkv_mode}")
+    if wkv_mode in _LOADED_WKV_MODES:
+        return
     t0 = time.perf_counter()
     log(f"loading CUDA extensions v3a_ops + fast_ops + wkv={wkv_mode}")
     cuda_flags = ["-O3", "--use_fast_math", "--extra-device-vectorization"] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
@@ -2184,6 +2204,7 @@ def load_extensions(wkv_mode: str = "fp16") -> None:
         load(name="rwkv7_wkv_fp32_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cu")], is_python_module=False, verbose=True, extra_cflags=["-O3", "-D_IO_FP16_"], extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas", "-O3", "-D_IO_FP16_"])
     else:
         raise ValueError(f"unknown wkv_mode: {wkv_mode}")
+    _LOADED_WKV_MODES.add(wkv_mode)
     log(f"CUDA extensions loaded in {time.perf_counter() - t0:.3f}s")
 
 
