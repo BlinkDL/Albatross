@@ -411,7 +411,49 @@ def speed_text(rate, B, tokens, chars):
 def gib(n):
     return n / 1_000_000_000.0
 
-def generate_batch_text(
+class GenerationOwner:
+    """Own GPU frames independently of Gradio's cancelled iterator lifetime."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = None
+
+    def stream(self, factory, *args, **kwargs):
+        with self.lock:
+            # Cancellation can release Gradio's queue slot without closing the
+            # nested Python generator. Close it before allocating another state.
+            if self.active is not None:
+                self.active.close()
+            inner = factory(*args, **kwargs)
+            self.active = inner
+        try:
+            while True:
+                with self.lock:
+                    if self.active is not inner:
+                        return
+                    try:
+                        item = next(inner)
+                    except StopIteration:
+                        return
+                    if item[2].get("done"):
+                        inner.close()
+                        self.active = None
+                yield item
+        finally:
+            with self.lock:
+                inner.close()
+                if self.active is inner:
+                    self.active = None
+
+
+generation_owner = GenerationOwner()
+
+
+def generate_batch_text(*args, **kwargs):
+    yield from generation_owner.stream(_generate_batch_text, *args, **kwargs)
+
+
+def _generate_batch_text(
     ctx,
     token_count=200,
     batch_size=1,
@@ -425,131 +467,146 @@ def generate_batch_text(
     batch_limit = max_bsz,
     combine_output = True,
 ):
-    # Both UI generators share one queue slot: never change the global route
-    # while another request is using its state or replaying a captured graph.
-    v3a.set_wkv_mode(wkv_mode)
-    req_t0 = time.perf_counter()
-    user_token_count = int(token_count)
-    rwkv_model = model
-    pipe = pipeline
-    sample_temperature = float(temperature)
-    sample_top_p = float(top_p)
-    if sample_temperature <= 0:
-        sample_temperature = 1.0
-        sample_top_p = 0
-    else:
-        sample_temperature = max(0.2, sample_temperature)
-    alpha_frequency = float(countPenalty)
-    alpha_presence = float(presencePenalty)
-    ctx = ctx.strip()
-    input_ids = pipe.encode(ctx)[-ctx_limit:]
-    input_token_count = len(input_ids)
-    B = min(batch_limit, max(1, int(batch_size)))
-    batch_rows = None
-    all_tokens = [[] for _ in range(B)]
-    out_last = [0 for _ in range(B)]
-    out_str = ['' for _ in range(B)]
-    occurrence_count = None
-    occurrence_presence = None
-    finished = [False for _ in range(B)]
-    speed_t0 = None
-    speed_tokens = 0
-    total_tokens = 0
-    speed_info = ""
-    decode_cache = {}
-    state = rwkv_model.zero_state(1)
-    decode_state, decode_x, decode_graph, decode_output = get_decode_ctx(B, decode_cache)
-    next_tokens = [0 for _ in range(B)]
-    out = None
-    for i in range(int(token_count)):
-
-        if i == 0:
-            if len(input_ids) == 0:
-                yield "", "", {"done": True, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "B": B, "T": user_token_count, "In": input_token_count, "TPS": 0.0, "Time": 0.0, "Token": 0, "Char": 0, "VRAMUsed": 0, "VRAMTotal": 0, "token_counts": [0 for _ in range(B)], "texts": out_str.copy()}
-                return
-            while len(input_ids) > 0:
-                token_device = "cpu" if rwkv_model.emb_cpu else "cuda"
-                tokens = torch.tensor(input_ids[:CHUNK_LEN], dtype=torch.long, device=token_device)
-                out = rwkv_model.forward(tokens, state).view(-1)
-                input_ids = input_ids[CHUNK_LEN:]
-            torch.cuda.synchronize()
-            copy_state_to_batch(decode_state, state)
-            logits = out.view(1, -1).repeat(B, 1)
+    state = decode_state = decode_x = decode_graph = decode_output = None
+    decode_cache = None
+    out = logits = tokens = sampled_tensor = None
+    occurrence_count = occurrence_presence = batch_rows = None
+    try:
+        # Both UI generators share one queue slot: never change the global route
+        # while another request is using its state or replaying a captured graph.
+        v3a.set_wkv_mode(wkv_mode)
+        req_t0 = time.perf_counter()
+        user_token_count = int(token_count)
+        rwkv_model = model
+        pipe = pipeline
+        sample_temperature = float(temperature)
+        sample_top_p = float(top_p)
+        if sample_temperature <= 0:
+            sample_temperature = 1.0
+            sample_top_p = 0
         else:
-            decode_x.copy_(tokens_to_x(next_tokens))
-            if decode_graph is None:
-                decode_output = rwkv_model.forward_from_x(decode_x, decode_state, v3a.select_path(B, 1))
-            else:
-                decode_graph.replay()
-            logits = decode_output.view(B, -1)
-
-        if occurrence_count is None:
-            occurrence_count = torch.zeros((B, logits.size(-1)), device=logits.device, dtype=logits.dtype)
-            occurrence_presence = torch.zeros_like(occurrence_count)
-            batch_rows = torch.arange(B, device=logits.device)
-        if alpha_frequency:
-            logits.sub_(occurrence_count, alpha=alpha_frequency)
-        if alpha_presence:
-            logits.sub_(occurrence_presence)
-
-        assert logits.is_cuda and logits.dim() == 2
-        sampled_tensor = sample_logits_batch_cuda(
-            logits,
-            sample_temperature,
-            sample_top_p,
-            min(SAMPLER_TOP_K, logits.size(-1)),
-        )
-        sampled = sampled_tensor.detach().cpu().tolist()
-        active = 0
+            sample_temperature = max(0.2, sample_temperature)
+        alpha_frequency = float(countPenalty)
+        alpha_presence = float(presencePenalty)
+        ctx = ctx.strip()
+        input_ids = pipe.encode(ctx)[-ctx_limit:]
+        input_token_count = len(input_ids)
+        B = min(batch_limit, max(1, int(batch_size)))
+        batch_rows = None
+        all_tokens = [[] for _ in range(B)]
+        out_last = [0 for _ in range(B)]
+        out_str = ['' for _ in range(B)]
+        occurrence_count = None
+        occurrence_presence = None
+        finished = [False for _ in range(B)]
+        speed_t0 = None
+        speed_tokens = 0
+        total_tokens = 0
+        speed_info = ""
+        decode_cache = {}
+        state = rwkv_model.zero_state(1)
+        decode_state, decode_x, decode_graph, decode_output = get_decode_ctx(B, decode_cache)
         next_tokens = [0 for _ in range(B)]
-        if penalty_decay != 1:
-            occurrence_count.mul_(penalty_decay)
-        occurrence_count[batch_rows, sampled_tensor] += 1
-        if alpha_presence:
-            occurrence_presence[batch_rows, sampled_tensor] = alpha_presence
-        for b in range(B):
-            if finished[b]:
-                continue
-            token = sampled[b]
-            if token == 0:
-                finished[b] = True
-                continue
-            active += 1
-            next_tokens[b] = token
-            all_tokens[b].append(token)
+        out = None
+        for i in range(int(token_count)):
 
-            tmp = pipe.decode(all_tokens[b][out_last[b]:])
-            if '\ufffd' not in tmp:
-                out_str[b] += tmp
-                out_last[b] = len(all_tokens[b])
-        total_tokens += active
-        if active == 0:
-            break
-        if speed_t0 is None:
-            speed_t0 = time.perf_counter()
-        else:
-            speed_tokens += B
-            elapsed = max(1e-9, time.perf_counter() - speed_t0)
-            current_text = output_text(B, out_str) if combine_output else ""
-            char_count = len(current_text) if combine_output else sum(map(len, out_str))
-            speed_info = speed_text(speed_tokens / elapsed, B, total_tokens, char_count)
-        if i == 0 or i % max(1, int(yield_every)) == 0:
-            current_text = output_text(B, out_str) if combine_output else ""
-            yield current_text, speed_info, {"done": False, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    free, total = torch.cuda.mem_get_info()
-    del out
-    del state
-    del decode_cache
-    current_text = output_text(B, out_str) if combine_output else ""
-    char_count = len(current_text) if combine_output else sum(map(len, out_str))
-    if speed_t0 is not None and not speed_info:
-        speed_info = speed_text(0.0, B, total_tokens, char_count)
-    elapsed = time.perf_counter() - req_t0
-    final_tps = speed_tokens / max(1e-9, time.perf_counter() - speed_t0) if speed_t0 is not None else 0.0
-    used = total - free
-    meta = {"done": True, "timestamp": timestamp, "B": B, "T": user_token_count, "In": input_token_count, "TPS": final_tps, "Time": elapsed, "Token": total_tokens, "Char": char_count, "VRAMUsed": used, "VRAMTotal": total, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
-    yield current_text, speed_info, meta
+            if i == 0:
+                if len(input_ids) == 0:
+                    yield "", "", {"done": True, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "B": B, "T": user_token_count, "In": input_token_count, "TPS": 0.0, "Time": 0.0, "Token": 0, "Char": 0, "VRAMUsed": 0, "VRAMTotal": 0, "token_counts": [0 for _ in range(B)], "texts": out_str.copy()}
+                    return
+                while len(input_ids) > 0:
+                    token_device = "cpu" if rwkv_model.emb_cpu else "cuda"
+                    tokens = torch.tensor(input_ids[:CHUNK_LEN], dtype=torch.long, device=token_device)
+                    out = rwkv_model.forward(tokens, state).view(-1)
+                    input_ids = input_ids[CHUNK_LEN:]
+                torch.cuda.synchronize()
+                copy_state_to_batch(decode_state, state)
+                logits = out.view(1, -1).repeat(B, 1)
+            else:
+                decode_x.copy_(tokens_to_x(next_tokens))
+                if decode_graph is None:
+                    decode_output = rwkv_model.forward_from_x(decode_x, decode_state, v3a.select_path(B, 1))
+                else:
+                    decode_graph.replay()
+                logits = decode_output.view(B, -1)
+
+            if occurrence_count is None:
+                occurrence_count = torch.zeros((B, logits.size(-1)), device=logits.device, dtype=logits.dtype)
+                occurrence_presence = torch.zeros_like(occurrence_count)
+                batch_rows = torch.arange(B, device=logits.device)
+            if alpha_frequency:
+                logits.sub_(occurrence_count, alpha=alpha_frequency)
+            if alpha_presence:
+                logits.sub_(occurrence_presence)
+
+            assert logits.is_cuda and logits.dim() == 2
+            sampled_tensor = sample_logits_batch_cuda(
+                logits,
+                sample_temperature,
+                sample_top_p,
+                min(SAMPLER_TOP_K, logits.size(-1)),
+            )
+            sampled = sampled_tensor.detach().cpu().tolist()
+            active = 0
+            next_tokens = [0 for _ in range(B)]
+            if penalty_decay != 1:
+                occurrence_count.mul_(penalty_decay)
+            occurrence_count[batch_rows, sampled_tensor] += 1
+            if alpha_presence:
+                occurrence_presence[batch_rows, sampled_tensor] = alpha_presence
+            for b in range(B):
+                if finished[b]:
+                    continue
+                token = sampled[b]
+                if token == 0:
+                    finished[b] = True
+                    continue
+                active += 1
+                next_tokens[b] = token
+                all_tokens[b].append(token)
+
+                tmp = pipe.decode(all_tokens[b][out_last[b]:])
+                if '\ufffd' not in tmp:
+                    out_str[b] += tmp
+                    out_last[b] = len(all_tokens[b])
+            total_tokens += active
+            if active == 0:
+                break
+            if speed_t0 is None:
+                speed_t0 = time.perf_counter()
+            else:
+                speed_tokens += B
+                elapsed = max(1e-9, time.perf_counter() - speed_t0)
+                current_text = output_text(B, out_str) if combine_output else ""
+                char_count = len(current_text) if combine_output else sum(map(len, out_str))
+                speed_info = speed_text(speed_tokens / elapsed, B, total_tokens, char_count)
+            if i == 0 or i % max(1, int(yield_every)) == 0:
+                current_text = output_text(B, out_str) if combine_output else ""
+                yield current_text, speed_info, {"done": False, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        free, total = torch.cuda.mem_get_info()
+        current_text = output_text(B, out_str) if combine_output else ""
+        char_count = len(current_text) if combine_output else sum(map(len, out_str))
+        if speed_t0 is not None and not speed_info:
+            speed_info = speed_text(0.0, B, total_tokens, char_count)
+        elapsed = time.perf_counter() - req_t0
+        final_tps = speed_tokens / max(1e-9, time.perf_counter() - speed_t0) if speed_t0 is not None else 0.0
+        used = total - free
+        meta = {"done": True, "timestamp": timestamp, "B": B, "T": user_token_count, "In": input_token_count, "TPS": final_tps, "Time": elapsed, "Token": total_tokens, "Char": char_count, "VRAMUsed": used, "VRAMTotal": total, "token_counts": [len(tokens) for tokens in all_tokens], "texts": out_str.copy()}
+        yield current_text, speed_info, meta
+    finally:
+        # Clear every CUDA alias even if an exception traceback retains this frame.
+        # Stop may leave the outer Gradio iterator alive until its next request.
+        try:
+            if decode_graph is not None:
+                torch.cuda.synchronize()
+                decode_graph.reset()
+        finally:
+            if decode_cache is not None:
+                decode_cache.clear()
+            state = decode_state = decode_x = decode_graph = decode_output = None
+            decode_cache = out = logits = tokens = sampled_tensor = None
+            occurrence_count = occurrence_presence = batch_rows = None
 
 def print_summary(prefix, meta):
     print(

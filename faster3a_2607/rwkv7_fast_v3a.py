@@ -2175,6 +2175,8 @@ def set_wkv_mode(wkv_mode: str) -> None:
 
 
 def load_extensions(wkv_mode: str = "fp16") -> None:
+    # Legacy setup remains WKV_MODE=mode; load_extensions(mode); RWKV7().
+    # Loading/preloading extensions alone must not change the active route.
     if wkv_mode not in ("fp16", "fp32io16"):
         raise ValueError(f"unknown wkv_mode: {wkv_mode}")
     if wkv_mode in _LOADED_WKV_MODES:
